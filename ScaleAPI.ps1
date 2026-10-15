@@ -1,13 +1,33 @@
-# Scale HyperCore API Toolkit — Windows UI for SC//HyperCore REST (v1 + SNMP v2).
-# Uses curl.exe because Windows PowerShell 5.1 TLS fails against HyperCore self-signed certs.
-# Credentials stay in memory for the session only; never written to the log.
+﻿# Scale HyperCore API Toolkit - Windows UI for SC//HyperCore REST (v1 + SNMP v2).
+# Talks to the cluster with curl.exe (TLS 1.2 + no revoke) and falls back to .NET if
+# Windows schannel fails the HyperCore handshake. Credentials stay in memory only.
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
+
+# Prefer TLS 1.2 for HyperCore; ignore self-signed certs on the .NET fallback path.
+try {
+  [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+} catch {}
+if (-not ("HcTrustAll" -as [type])) {
+  Add-Type @"
+using System.Net;
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
+public static class HcTrustAll {
+  public static bool Allow(object sender, X509Certificate cert, X509Chain chain, SslPolicyErrors errors) { return true; }
+  public static void Enable() {
+    ServicePointManager.ServerCertificateValidationCallback = Allow;
+  }
+}
+"@
+}
+[HcTrustAll]::Enable()
 
 $script:AppTitle = "Scale HyperCore API"
 $logFile = Join-Path $PSScriptRoot "ScaleAPI-log.txt"
 $script:VmCache = @()
 $script:NodeCache = @()
+$script:Transport = $null   # 'curl' or 'dotnet' once a working path is found
 
 # --- helpers: UI factories ---
 function New-Label([string]$text, [int]$x, [int]$y, [int]$w = 110, [int]$h = 22) {
@@ -93,27 +113,42 @@ function Test-Credentials {
   return $true
 }
 
-function Invoke-Hc {
-  param(
-    [Parameter(Mandatory)][ValidateSet("GET","POST","PATCH","PUT","DELETE")][string]$Method,
-    [Parameter(Mandatory)][string]$Path,
-    [string]$Body = "",
-    [int]$TimeoutSec = 60
-  )
+function Get-HcUrl([string]$Path) {
   $ip = $ipBox.Text.Trim()
+  if ($Path -match '^https?://') { return $Path }
+  if ($Path.StartsWith("/update/")) { return "https://$ip$Path" }
+  return "https://$ip/rest$Path"
+}
+
+function Invoke-HcCurl {
+  param(
+    [string]$Method,
+    [string]$Url,
+    [string]$Body,
+    [int]$TimeoutSec
+  )
   $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($userBox.Text.Trim() + ":" + $passBox.Text))
   $cfg = [IO.Path]::GetTempFileName()
   $bf = $null
+  $exit = 0
   try {
     Set-Content -Path $cfg -Value "header = `"Authorization: Basic $b64`"" -Encoding ASCII
-    $url = if ($Path -match '^https?://') { $Path } elseif ($Path.StartsWith("/update/")) { "https://$ip$Path" } else { "https://$ip/rest$Path" }
-    $ca = @("-sSk", "--max-time", "$TimeoutSec", "-K", $cfg, "-X", $Method, "-w", "`n%{http_code}", $url)
+    # Force TLS 1.2 and skip schannel revocation checks - common HyperCore + Windows curl fixes.
+    $ca = @(
+      "-sS", "-k", "--ssl-no-revoke",
+      "--tlsv1.2", "--tls-max", "1.2",
+      "--max-time", "$TimeoutSec",
+      "-K", $cfg, "-X", $Method,
+      "-w", "`n%{http_code}",
+      $Url
+    )
     if ($Body) {
       $bf = [IO.Path]::GetTempFileName()
       [IO.File]::WriteAllText($bf, $Body)
       $ca += @("-H", "Content-Type: application/json", "--data-binary", "@$bf")
     }
     $raw = (& curl.exe @ca 2>&1) -join "`n"
+    $exit = $LASTEXITCODE
   } finally {
     Remove-Item $cfg -Force -ErrorAction SilentlyContinue
     if ($bf) { Remove-Item $bf -Force -ErrorAction SilentlyContinue }
@@ -121,7 +156,120 @@ function Invoke-Hc {
   $lines = @($raw -split "`n")
   $code = if ($lines.Count) { $lines[-1].Trim() } else { "000" }
   $bodyText = if ($lines.Count -gt 1) { ($lines[0..($lines.Count - 2)] -join "`n").Trim() } else { "" }
-  [pscustomobject]@{ Code = $code; Body = $bodyText }
+  # curl SSL/connect failures often still print http_code 000
+  if ($exit -ne 0 -and ($code -notmatch '^\d{3}$' -or $code -eq "000")) {
+    return [pscustomobject]@{ Ok = $false; Code = "000"; Body = $bodyText; Exit = $exit }
+  }
+  if ($code -notmatch '^\d{3}$') {
+    return [pscustomobject]@{ Ok = $false; Code = "000"; Body = $raw; Exit = $exit }
+  }
+  [pscustomobject]@{ Ok = $true; Code = $code; Body = $bodyText; Exit = $exit }
+}
+
+function Invoke-HcDotNet {
+  param(
+    [string]$Method,
+    [string]$Url,
+    [string]$Body,
+    [int]$TimeoutSec
+  )
+  try {
+    $req = [Net.HttpWebRequest]::Create($Url)
+    $req.Method = $Method
+    $req.Timeout = $TimeoutSec * 1000
+    $req.ReadWriteTimeout = $TimeoutSec * 1000
+    $req.Accept = "application/json"
+    $req.UserAgent = "ScaleHyperCoreAPIToolkit/0.2"
+    $token = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($userBox.Text.Trim() + ":" + $passBox.Text))
+    $req.Headers.Add("Authorization", "Basic $token")
+    if ($Body -and $Method -in @("POST", "PATCH", "PUT")) {
+      $bytes = [Text.Encoding]::UTF8.GetBytes($Body)
+      $req.ContentType = "application/json"
+      $req.ContentLength = $bytes.Length
+      $stream = $req.GetRequestStream()
+      $stream.Write($bytes, 0, $bytes.Length)
+      $stream.Close()
+    }
+    $resp = $req.GetResponse()
+    try {
+      $sr = New-Object IO.StreamReader($resp.GetResponseStream())
+      $text = $sr.ReadToEnd()
+      $sr.Close()
+      $code = [int]$resp.StatusCode
+      return [pscustomobject]@{ Ok = $true; Code = "$code"; Body = $text; Exit = 0 }
+    } finally {
+      $resp.Close()
+    }
+  } catch [Net.WebException] {
+    $ex = $_.Exception
+    $resp = $ex.Response
+    if ($resp) {
+      try {
+        $sr = New-Object IO.StreamReader($resp.GetResponseStream())
+        $text = $sr.ReadToEnd()
+        $sr.Close()
+      } catch { $text = $ex.Message }
+      $code = [int]$resp.StatusCode
+      return [pscustomobject]@{ Ok = $true; Code = "$code"; Body = $text; Exit = 0 }
+    }
+    return [pscustomobject]@{ Ok = $false; Code = "000"; Body = $ex.Message; Exit = 1 }
+  } catch {
+    return [pscustomobject]@{ Ok = $false; Code = "000"; Body = $_.Exception.Message; Exit = 1 }
+  }
+}
+
+function Invoke-Hc {
+  param(
+    [Parameter(Mandatory)][ValidateSet("GET","POST","PATCH","PUT","DELETE")][string]$Method,
+    [Parameter(Mandatory)][string]$Path,
+    [string]$Body = "",
+    [int]$TimeoutSec = 60
+  )
+  $url = Get-HcUrl $Path
+
+  # Stick with the transport that already worked this session.
+  if ($script:Transport -eq "dotnet") {
+    $r = Invoke-HcDotNet $Method $url $Body $TimeoutSec
+    return [pscustomobject]@{ Code = $r.Code; Body = $r.Body }
+  }
+  if ($script:Transport -eq "curl") {
+    $r = Invoke-HcCurl $Method $url $Body $TimeoutSec
+    if ($r.Ok) { return [pscustomobject]@{ Code = $r.Code; Body = $r.Body } }
+    # curl broke mid-session - try .NET once
+    Say "curl failed; trying .NET TLS fallback..."
+    $r2 = Invoke-HcDotNet $Method $url $Body $TimeoutSec
+    if ($r2.Ok) {
+      $script:Transport = "dotnet"
+      return [pscustomobject]@{ Code = $r2.Code; Body = $r2.Body }
+    }
+    return [pscustomobject]@{ Code = "000"; Body = "curl: $($r.Body)`r`n.NET: $($r2.Body)" }
+  }
+
+  # First request: try hardened curl, then .NET fallback.
+  $r = Invoke-HcCurl $Method $url $Body $TimeoutSec
+  if ($r.Ok) {
+    $script:Transport = "curl"
+    return [pscustomobject]@{ Code = $r.Code; Body = $r.Body }
+  }
+  Say "curl TLS/connect failed ($($r.Exit)): $($r.Body)"
+  Say "Retrying with .NET HttpWebRequest (TLS 1.2, cert check skipped)..."
+  $r2 = Invoke-HcDotNet $Method $url $Body $TimeoutSec
+  if ($r2.Ok) {
+    $script:Transport = "dotnet"
+    Say "Connected via .NET fallback."
+    return [pscustomobject]@{ Code = $r2.Code; Body = $r2.Body }
+  }
+  [pscustomobject]@{
+    Code = "000"
+    Body = @"
+TLS connection failed over both curl and .NET.
+
+curl: $($r.Body)
+.NET: $($r2.Body)
+
+Check that $($ipBox.Text.Trim()) is a node lanIP reachable on TCP 443, and that nothing is intercepting HTTPS.
+"@
+  }
 }
 
 function ConvertFrom-HcJson([string]$json) {
@@ -198,6 +346,7 @@ function Show-ClusterInfo {
   if (-not (Test-Credentials)) { return }
   Set-Busy $true
   try {
+    $script:Transport = $null  # re-probe curl vs .NET for this connect
     Say "--- Cluster $($ipBox.Text.Trim())"
     $c = Invoke-Hc GET "/v1/Cluster"
     if ($c.Code -eq "401") { Set-Connected $false "Login failed"; Say "Login failed (401)."; return }
@@ -206,7 +355,7 @@ function Show-ClusterInfo {
     $name = if ($rec.clusterName) { $rec.clusterName } else { "?" }
     $ver = if ($rec.icosVersion) { $rec.icosVersion } else { "?" }
     $uuid = if ($rec.uuid) { $rec.uuid } else { "?" }
-    Set-Connected $true "$name  ·  HyperCore $ver"
+    Set-Connected $true "$name  -  HyperCore $ver"
     $clusterOut.Text = @"
 Cluster name : $name
 Version      : $ver
@@ -246,7 +395,7 @@ function Show-UpdateStatus {
     Say "--- Update status (no auth)"
     $r = Invoke-Hc GET "/update/update_status.json"
     if ($r.Code -eq "404") {
-      $clusterOut.Text = "Update status: never updated / endpoint returned 404.`r`nTreat as unknown — fail closed for writes during upgrades."
+      $clusterOut.Text = "Update status: never updated / endpoint returned 404.`r`nTreat as unknown - fail closed for writes during upgrades."
       Say "Update status 404 (never updated or unavailable)."
       return
     }
@@ -340,7 +489,7 @@ function Invoke-VmAction([string]$actionType) {
   try {
     Say "--- VM $actionType  $($vm.name)"
     $body = (@(@{ virDomainUUID = $vm.uuid; actionType = $actionType }) | ConvertTo-Json -Compress -Depth 5)
-    # ConvertTo-Json of single-element array becomes object in PS 5.1 — force array wrapper
+    # ConvertTo-Json of single-element array becomes object in PS 5.1 - force array wrapper
     if ($body -notmatch '^\s*\[') { $body = "[$body]" }
     $r = Invoke-Hc POST "/v1/VirDomain/action" $body
     if ($r.Code -notin @("200", "201")) { Say "Action failed ($($r.Code)): $($r.Body)"; return }
@@ -465,7 +614,7 @@ function Get-SnmpStatus {
   $ver = if ($rec.icosVersion) { $rec.icosVersion } else { "unknown" }
   $name = if ($rec.clusterName) { $rec.clusterName } else { "" }
   Write-Snmp "Cluster $name  HyperCore $ver"
-  Set-Connected $true "$name  ·  HyperCore $ver"
+  Set-Connected $true "$name  -  HyperCore $ver"
   $s = Invoke-Hc GET "/v2/SNMPConfig"
   if ($s.Code -eq "404") { Write-Snmp "This cluster has no SNMP API. It needs HyperCore 9.7.1 or newer."; return $null }
   if ($s.Code -ne "200") { Write-Snmp "SNMP status failed ($($s.Code)): $($s.Body)"; return $null }
@@ -660,7 +809,7 @@ $sendApiBtn.Add_Click({
       $parsed = ConvertFrom-HcJson $r.Body
       if ($parsed -and $parsed.taskTag) { [void](Wait-HcTask ([string]$parsed.taskTag)) }
     }
-    Say "$method $path → $($r.Code)"
+    Say "$method $path -> $($r.Code)"
   } finally { Set-Busy $false }
 })
 
