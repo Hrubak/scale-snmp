@@ -10,7 +10,7 @@ A Windows UI for common SC//HyperCore REST API tasks. Point it at a client clust
 
 | Tab | What it does |
 |---|---|
-| **Cluster** | Cluster name / HyperCore version, node list (`lanIP`), software update status |
+| **Cluster** | Cluster name / HyperCore version, node list (`lanIP`), software update status. **Test TLS** (connection bar) logs which protocol succeeded |
 | **VMs** | List VMs; Start, Shutdown, Power off, Reboot; create a snapshot |
 | **Snapshots** | List all snapshots; delete selected |
 | **SNMP** | Check SNMP status; enable with a community string (HyperCore **9.7.1+**) |
@@ -22,7 +22,7 @@ Each run appends to `ScaleAPI-log.txt` next to the app. The password is never sa
 
 ## Requirements
 
-- Windows 10/11 with built-in `curl.exe` and Windows PowerShell 5.1
+- Windows 10/11 with built-in `curl.exe` and Windows PowerShell 5.1. HyperCore 9.7.11 is TLS 1.3 only. Windows 10 Schannel cannot do TLS 1.3. Install Git for Windows (its `usr\bin\openssl.exe`, not its curl) or run the app on Windows 11.
 - Network reachability to a cluster node IP (there is no cluster VIP — use a node `lanIP`)
 - SNMP tab needs SC//HyperCore **9.7.1 or newer** (REST v2). Other tabs work on 9.6+
 
@@ -43,6 +43,6 @@ Each run appends to `ScaleAPI-log.txt` next to the app. The password is never sa
 | `GET /rest/v1/User`, `ISO` | Users and ISO library |
 | `GET /rest/v1/TaskTag/{tag}` | Wait for mutating calls to finish |
 
-Auth is HTTP Basic. Clusters use self-signed certificates, so requests skip certificate checks. Windows PowerShell’s own web client fails TLS against HyperCore, which is why the app uses `curl.exe`.
+Auth is HTTP Basic. Clusters use self-signed certificates, so requests skip certificate checks. Schannel `curl.exe` (TLS 1.3, then default, then TLS 1.0-1.1, always `--ssl-no-revoke`) and .NET are tried first. HyperCore 9.7.11 negotiates TLS 1.3 only (`TLS_AES_256_GCM_SHA384`). Windows 10 Schannel fails that with `SEC_E_ALGORITHM_MISMATCH` before the handshake, and Git's `curl.exe` is Schannel-only. The app then sends the HTTP request through `openssl s_client` (Git's `C:\Program Files\Git\usr\bin\openssl.exe`, or `SCALE_OPENSSL`, or a path in `ScaleAPI-openssl.path`). **Test TLS** does this without sending the password. App version 0.4 (see `CHANGELOG.md`).
 
 References: [ScaleComputing/RestAPIExamples](https://github.com/ScaleComputing/RestAPIExamples), cluster OpenAPI at `https://<node-ip>/rest/v1/docs/` and `https://<node-ip>/rest/v2/openAPI.json`.
