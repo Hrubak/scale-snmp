@@ -43,6 +43,6 @@ Each run appends to `ScaleAPI-log.txt` next to the app. The password is never sa
 | `GET /rest/v1/User`, `ISO` | Users and ISO library |
 | `GET /rest/v1/TaskTag/{tag}` | Wait for mutating calls to finish |
 
-Auth is HTTP Basic. Clusters use self-signed certificates, so requests skip certificate checks. Windows PowerShell’s own web client fails TLS against HyperCore, which is why the app uses `curl.exe`.
+Auth is HTTP Basic. Clusters use self-signed certificates, so requests skip certificate checks. On Windows, built-in `curl.exe` uses schannel and can fail the HyperCore handshake with `SEC_E_ILLEGAL_MESSAGE`; the app forces TLS 1.2 / `--ssl-no-revoke` and automatically falls back to .NET `HttpWebRequest` when curl cannot connect.
 
 References: [ScaleComputing/RestAPIExamples](https://github.com/ScaleComputing/RestAPIExamples), cluster OpenAPI at `https://<node-ip>/rest/v1/docs/` and `https://<node-ip>/rest/v2/openAPI.json`.
