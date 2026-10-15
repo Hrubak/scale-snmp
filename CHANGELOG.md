@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.1
+
+- Removed the legacy SNMP launcher (`Scale SNMP.cmd` and `ScaleSNMP.ps1`). Use `Scale API.cmd`.
+
 ## 0.4
 
 - HyperCore 9.7.11.227728 negotiates TLS 1.3 only (`TLS_AES_256_GCM_SHA384`, X25519). Windows 10 Schannel fails `curl --tlsv1.3` with `SEC_E_ALGORITHM_MISMATCH` before the handshake, and a TLS 1.2 attempt fails in the handshake with `SEC_E_UNSUPPORTED_FUNCTION`.

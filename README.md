@@ -5,7 +5,7 @@ A Windows UI for common SC//HyperCore REST API tasks. Point it at a client clust
 ## Use
 
 1. Copy the folder to a Windows PC that can reach the cluster.
-2. Double-click **Scale API.cmd** (or **Scale SNMP.cmd** — same app).
+2. Double-click **Scale API.cmd**.
 3. Enter the cluster IP (or hostname), login, and password, then **Connect**.
 
 | Tab | What it does |
@@ -43,6 +43,6 @@ Each run appends to `ScaleAPI-log.txt` next to the app. The password is never sa
 | `GET /rest/v1/User`, `ISO` | Users and ISO library |
 | `GET /rest/v1/TaskTag/{tag}` | Wait for mutating calls to finish |
 
-Auth is HTTP Basic. Clusters use self-signed certificates, so requests skip certificate checks. Schannel `curl.exe` (TLS 1.3, then default, then TLS 1.0-1.1, always `--ssl-no-revoke`) and .NET are tried first. HyperCore 9.7.11 negotiates TLS 1.3 only (`TLS_AES_256_GCM_SHA384`). Windows 10 Schannel fails that with `SEC_E_ALGORITHM_MISMATCH` before the handshake, and Git's `curl.exe` is Schannel-only. The app then sends the HTTP request through `openssl s_client` (Git's `C:\Program Files\Git\usr\bin\openssl.exe`, or `SCALE_OPENSSL`, or a path in `ScaleAPI-openssl.path`). **Test TLS** does this without sending the password. App version 0.4 (see `CHANGELOG.md`).
+Auth is HTTP Basic. Clusters use self-signed certificates, so requests skip certificate checks. Schannel `curl.exe` (TLS 1.3, then default, then TLS 1.0-1.1, always `--ssl-no-revoke`) and .NET are tried first. HyperCore 9.7.11 negotiates TLS 1.3 only (`TLS_AES_256_GCM_SHA384`). Windows 10 Schannel fails that with `SEC_E_ALGORITHM_MISMATCH` before the handshake, and Git's `curl.exe` is Schannel-only. The app then sends the HTTP request through `openssl s_client` (Git's `C:\Program Files\Git\usr\bin\openssl.exe`, or `SCALE_OPENSSL`, or a path in `ScaleAPI-openssl.path`). **Test TLS** does this without sending the password. App version 0.4.1 (see `CHANGELOG.md`).
 
 References: [ScaleComputing/RestAPIExamples](https://github.com/ScaleComputing/RestAPIExamples), cluster OpenAPI at `https://<node-ip>/rest/v1/docs/` and `https://<node-ip>/rest/v2/openAPI.json`.

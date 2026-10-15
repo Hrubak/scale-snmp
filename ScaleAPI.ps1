@@ -1,4 +1,4 @@
-﻿# Scale HyperCore API Toolkit 0.4 - Windows UI for SC//HyperCore REST (v1 + SNMP v2).
+﻿# Scale HyperCore API Toolkit 0.4.1 - Windows UI for SC//HyperCore REST (v1 + SNMP v2).
 # Schannel curl (TLS 1.3, then default, then TLS 1.0-1.1) and .NET run first.
 # HyperCore 9.7.11 is TLS 1.3 only (TLS_AES_256_GCM_SHA384). Windows 10 Schannel
 # fails with SEC_E_ALGORITHM_MISMATCH before the handshake. Git curl is Schannel too.
@@ -7,7 +7,7 @@
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
-$script:AppVersion = "0.4"
+$script:AppVersion = "0.4.1"
 $script:AppTitle = "Scale HyperCore API"
 $logFile = Join-Path $PSScriptRoot "ScaleAPI-log.txt"
 $script:VmCache = @()
