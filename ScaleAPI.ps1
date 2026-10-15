@@ -1,4 +1,4 @@
-# Scale HyperCore API Toolkit — Windows UI for SC//HyperCore REST (v1 + SNMP v2).
+﻿# Scale HyperCore API Toolkit - Windows UI for SC//HyperCore REST (v1 + SNMP v2).
 # Uses curl.exe because Windows PowerShell 5.1 TLS fails against HyperCore self-signed certs.
 # Credentials stay in memory for the session only; never written to the log.
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
@@ -206,7 +206,7 @@ function Show-ClusterInfo {
     $name = if ($rec.clusterName) { $rec.clusterName } else { "?" }
     $ver = if ($rec.icosVersion) { $rec.icosVersion } else { "?" }
     $uuid = if ($rec.uuid) { $rec.uuid } else { "?" }
-    Set-Connected $true "$name  ·  HyperCore $ver"
+    Set-Connected $true "$name  -  HyperCore $ver"
     $clusterOut.Text = @"
 Cluster name : $name
 Version      : $ver
@@ -246,7 +246,7 @@ function Show-UpdateStatus {
     Say "--- Update status (no auth)"
     $r = Invoke-Hc GET "/update/update_status.json"
     if ($r.Code -eq "404") {
-      $clusterOut.Text = "Update status: never updated / endpoint returned 404.`r`nTreat as unknown — fail closed for writes during upgrades."
+      $clusterOut.Text = "Update status: never updated / endpoint returned 404.`r`nTreat as unknown - fail closed for writes during upgrades."
       Say "Update status 404 (never updated or unavailable)."
       return
     }
@@ -340,7 +340,7 @@ function Invoke-VmAction([string]$actionType) {
   try {
     Say "--- VM $actionType  $($vm.name)"
     $body = (@(@{ virDomainUUID = $vm.uuid; actionType = $actionType }) | ConvertTo-Json -Compress -Depth 5)
-    # ConvertTo-Json of single-element array becomes object in PS 5.1 — force array wrapper
+    # ConvertTo-Json of single-element array becomes object in PS 5.1 - force array wrapper
     if ($body -notmatch '^\s*\[') { $body = "[$body]" }
     $r = Invoke-Hc POST "/v1/VirDomain/action" $body
     if ($r.Code -notin @("200", "201")) { Say "Action failed ($($r.Code)): $($r.Body)"; return }
@@ -465,7 +465,7 @@ function Get-SnmpStatus {
   $ver = if ($rec.icosVersion) { $rec.icosVersion } else { "unknown" }
   $name = if ($rec.clusterName) { $rec.clusterName } else { "" }
   Write-Snmp "Cluster $name  HyperCore $ver"
-  Set-Connected $true "$name  ·  HyperCore $ver"
+  Set-Connected $true "$name  -  HyperCore $ver"
   $s = Invoke-Hc GET "/v2/SNMPConfig"
   if ($s.Code -eq "404") { Write-Snmp "This cluster has no SNMP API. It needs HyperCore 9.7.1 or newer."; return $null }
   if ($s.Code -ne "200") { Write-Snmp "SNMP status failed ($($s.Code)): $($s.Body)"; return $null }
@@ -660,7 +660,7 @@ $sendApiBtn.Add_Click({
       $parsed = ConvertFrom-HcJson $r.Body
       if ($parsed -and $parsed.taskTag) { [void](Wait-HcTask ([string]$parsed.taskTag)) }
     }
-    Say "$method $path → $($r.Code)"
+    Say "$method $path -> $($r.Code)"
   } finally { Set-Busy $false }
 })
 
