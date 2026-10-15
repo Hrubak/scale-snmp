@@ -1,4 +1,4 @@
-﻿# Scale HyperCore API Toolkit 0.4.1 - Windows UI for SC//HyperCore REST (v1 + SNMP v2).
+﻿# Scale HyperCore API Toolkit 0.5.0 - Windows UI for SC//HyperCore REST (v1 + SNMP v2).
 # Schannel curl (TLS 1.3, then default, then TLS 1.0-1.1) and .NET run first.
 # HyperCore 9.7.11 is TLS 1.3 only (TLS_AES_256_GCM_SHA384). Windows 10 Schannel
 # fails with SEC_E_ALGORITHM_MISMATCH before the handshake. Git curl is Schannel too.
@@ -7,9 +7,12 @@
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
-$script:AppVersion = "0.4.1"
+$script:AppVersion = "0.5.0"
 $script:AppTitle = "Scale HyperCore API"
 $logFile = Join-Path $PSScriptRoot "ScaleAPI-log.txt"
+$saLib = Join-Path $PSScriptRoot "ScaleSuperAudit.ps1"
+if (-not (Test-Path -LiteralPath $saLib)) { throw "Missing ScaleSuperAudit.ps1 next to ScaleAPI.ps1." }
+. $saLib
 $script:VmCache = @()
 $script:NodeCache = @()
 $script:Transport = $null
@@ -1456,8 +1459,192 @@ $sendApiBtn.Add_Click({
   } finally { Set-Busy $false }
 })
 
+# ========== Tab: SuperAudit ==========
+$tabAudit = New-Object Windows.Forms.TabPage
+$tabAudit.Text = "SuperAudit"
+$runAuditBtn = New-Button "Run SuperAudit" 12 12 140
+$chooseAuditFolderBtn = New-Button "Choose folder" 160 12 130
+$openAuditBtn = New-Button "Open report" 300 12 120
+$openAuditBtn.Enabled = $false
+$auditFolderBox = New-TextBox 88 48 640
+$auditFolderBox.Text = $PSScriptRoot
+$auditFolderBox.Anchor = "Top,Left,Right"
+$auditOut = New-Object Windows.Forms.TextBox
+$auditOut.Multiline = $true
+$auditOut.ReadOnly = $true
+$auditOut.ScrollBars = "Both"
+$auditOut.Font = New-Object Drawing.Font("Consolas", 9)
+$auditOut.WordWrap = $false
+$auditOut.Location = New-Object Drawing.Point(12, 80)
+$auditOut.Size = New-Object Drawing.Size(860, 320)
+$auditOut.Anchor = "Top,Bottom,Left,Right"
+$tabAudit.Controls.AddRange(@(
+  $runAuditBtn, $chooseAuditFolderBtn, $openAuditBtn,
+  (New-Label "Save to" 12 48 70), $auditFolderBox, $auditOut
+))
+$script:LastAuditHtml = ""
+
+function Get-SaFailureText([string]$label, $response, [bool]$required) {
+  $code = [string]$response.Code
+  if ($code -eq "000") {
+    $detail = Format-HcPublicError ([string]$response.Body)
+    if ($required) { return "$label failed. $detail" }
+    return "$label unavailable. $detail"
+  }
+  if ($code -eq "401" -or $code -eq "403") {
+    return "$label failed (HTTP $code). Check the login and password."
+  }
+  if ($required) { return "$label failed (HTTP $code)." }
+  return "$label unavailable (HTTP $code)."
+}
+
+function New-SaCallResult([bool]$ok, $items, [string]$note, [bool]$required) {
+  $list = New-Object System.Collections.ArrayList
+  foreach ($item in (ConvertTo-SaArray $items)) {
+    if ($null -ne $item) { [void]$list.Add($item) }
+  }
+  return [pscustomobject]@{ Ok = $ok; Items = $list; Note = $note; Required = $required }
+}
+
+function Invoke-SaGet([string]$label, [string]$path, [bool]$required) {
+  Say "GET $path"
+  $response = Invoke-Hc GET $path 120
+  if ($response.Code -match '^2') {
+    $trimmed = ""
+    if ($response.Body) { $trimmed = $response.Body.Trim() }
+    $parsed = ConvertFrom-HcJson $response.Body
+    if ($null -eq $parsed) {
+      if ($trimmed -eq "" -or $trimmed -eq "[]" -or $trimmed -eq "null") {
+        return (New-SaCallResult $true $null "" $required)
+      }
+      $note = "$label returned HTTP $($response.Code) but the body was not JSON."
+      if (-not $required) { Say $note }
+      return (New-SaCallResult $false $null $note $required)
+    }
+    return (New-SaCallResult $true $parsed "" $required)
+  }
+  $note = Get-SaFailureText $label $response $required
+  if (-not $required) { Say $note }
+  return (New-SaCallResult $false $null $note $required)
+}
+
+function Start-SuperAudit {
+  if (-not (Test-Credentials)) { return }
+  $folder = $auditFolderBox.Text.Trim()
+  if (-not $folder) { $folder = $PSScriptRoot }
+  $runAuditBtn.Enabled = $false
+  $openAuditBtn.Enabled = $false
+  Set-Busy $true
+  $started = Get-Date
+  try {
+    Say "SuperAudit started. Read-only GET. The password is not written to the log or the report."
+    $notes = New-Object System.Collections.ArrayList
+    $clusterCall = Invoke-SaGet "Cluster" "/v1/Cluster" $true
+    if (-not $clusterCall.Ok) { throw [string]$clusterCall.Note }
+    $cluster = $null
+    if ($clusterCall.Items.Count -gt 0) { $cluster = $clusterCall.Items[0] }
+    if ($null -eq $cluster) { throw "Cluster response was empty." }
+
+    $nodeCall = Invoke-SaGet "Nodes" "/v1/Node" $true
+    if (-not $nodeCall.Ok) { throw [string]$nodeCall.Note }
+    $nodes = @($nodeCall.Items)
+
+    $vmCall = Invoke-SaGet "VMs" "/v1/VirDomain" $true
+    if (-not $vmCall.Ok) { throw [string]$vmCall.Note }
+    $vms = @($vmCall.Items)
+
+    $needDrives = $false
+    foreach ($node in $nodes) {
+      if ((ConvertTo-SaArray (Get-SaProp $node "drives")).Count -eq 0) { $needDrives = $true }
+    }
+    $extraDrives = @()
+    if ($needDrives) {
+      $driveCall = Invoke-SaGet "Drives" "/v1/Drive" $false
+      if ($driveCall.Ok) {
+        $extraDrives = @($driveCall.Items)
+        [void]$notes.Add("Node records did not include drives. Drive rows use GET /v1/Drive.")
+      }
+      elseif ($driveCall.Note) { [void]$notes.Add([string]$driveCall.Note) }
+    }
+
+    $replCall = Invoke-SaGet "Replication" "/v1/RemoteClusterConnection" $false
+    $repl = @()
+    if ($replCall.Ok) { $repl = @($replCall.Items) }
+    elseif ($replCall.Note) { [void]$notes.Add([string]$replCall.Note) }
+
+    $schedCall = Invoke-SaGet "Snapshot schedules" "/v1/VirDomainSnapshotSchedule" $false
+    $schedules = @()
+    if ($schedCall.Ok) { $schedules = @($schedCall.Items) }
+    elseif ($schedCall.Note) { [void]$notes.Add([string]$schedCall.Note) }
+
+    $isoCall = Invoke-SaGet "ISOs" "/v1/ISO" $false
+    $isos = @()
+    if ($isoCall.Ok) { $isos = @($isoCall.Items) }
+    elseif ($isoCall.Note) { [void]$notes.Add([string]$isoCall.Note) }
+
+    $condCall = Invoke-SaGet "Conditions" "/v1/Condition/filter?includeSet=true" $false
+    $conditions = @()
+    if ($condCall.Ok) {
+      $conditions = @($condCall.Items)
+    } else {
+      $condAll = Invoke-SaGet "Conditions" "/v1/Condition" $false
+      if ($condAll.Ok) {
+        $conditions = @($condAll.Items)
+        [void]$notes.Add("Condition filter is unavailable. Used /v1/Condition instead.")
+      } elseif ($condAll.Note) {
+        [void]$notes.Add([string]$condAll.Note)
+      }
+    }
+
+    Say ("Building SuperAudit report for {0} VM(s) and {1} node(s)." -f $vms.Count, $nodes.Count)
+    $report = New-SaReport -Cluster $cluster -Nodes $nodes -Vms $vms -Replication $repl `
+      -Schedules $schedules -Isos $isos -Conditions $conditions -ExtraDrives $extraDrives `
+      -Notes @($notes) -CollectedAt (Get-Date -Format "yyyy-MM-dd HH:mm:ss") `
+      -ElapsedSeconds ((Get-Date) - $started).TotalSeconds -ToolVersion $script:AppVersion
+    if (-not (Test-Path -LiteralPath $folder)) {
+      New-Item -ItemType Directory -Path $folder -Force | Out-Null
+    }
+    $saved = Export-SaReport -Report $report -Folder $folder
+    $script:LastAuditHtml = [string]$saved.HtmlPath
+    $auditOut.Text = $report.SummaryText + "`r`n`r`nReport: $($saved.HtmlPath)"
+    Say ("SuperAudit wrote {0}" -f $saved.HtmlPath)
+    Say ("Warnings: {0}. Compliance score: {1}." -f @($report.FlatWarnings).Count, $report.ComplianceScore)
+  } catch {
+    $message = Get-HcExceptionText $_
+    if (-not $message) { $message = [string]$_ }
+    $message = Format-HcPublicError $message
+    Say "SuperAudit failed: $message"
+    Show-Msg $message "Error"
+  } finally {
+    $runAuditBtn.Enabled = $true
+    if ($script:LastAuditHtml -and (Test-Path -LiteralPath $script:LastAuditHtml)) {
+      $openAuditBtn.Enabled = $true
+    }
+    Set-Busy $false
+  }
+}
+
+$runAuditBtn.Add_Click({ Start-SuperAudit })
+$chooseAuditFolderBtn.Add_Click({
+  $dialog = New-Object Windows.Forms.FolderBrowserDialog
+  $dialog.Description = "Choose a folder for the SuperAudit report"
+  if ($auditFolderBox.Text -and (Test-Path -LiteralPath $auditFolderBox.Text)) {
+    $dialog.SelectedPath = $auditFolderBox.Text
+  }
+  if ($dialog.ShowDialog() -eq "OK" -and $dialog.SelectedPath) {
+    $auditFolderBox.Text = $dialog.SelectedPath
+  }
+})
+$openAuditBtn.Add_Click({
+  if (-not $script:LastAuditHtml -or -not (Test-Path -LiteralPath $script:LastAuditHtml)) {
+    Show-Msg "Run SuperAudit before opening a report." "Warning"
+    return
+  }
+  Start-Process -FilePath $script:LastAuditHtml
+})
+
 # Assemble tabs
-$tabs.TabPages.AddRange(@($tabCluster, $tabVms, $tabSnaps, $tabSnmp, $tabAlerts, $tabSettings, $tabApi))
+$tabs.TabPages.AddRange(@($tabCluster, $tabVms, $tabSnaps, $tabSnmp, $tabAlerts, $tabSettings, $tabAudit, $tabApi))
 
 # Connect button = cluster refresh
 $connectBtn.Add_Click({ Show-ClusterInfo })

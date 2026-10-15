@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.0
+
+- SuperAudit tab. Read-only GET audit of the connected cluster: cluster, nodes, VMs (disks, network, snapshots, schedules, replication), drive health, ISOs, and active conditions.
+- Writes an HTML report and quoted CSV files into a timestamped folder next to the app, or into a folder you choose. Open report opens the HTML.
+- Endpoints that are missing on older HyperCore versions are skipped and listed in the report. The password and Authorization header are not logged or written into the report.
+- The layout follows [Scale Computing's SuperAudit example](https://github.com/ScaleComputing/RestAPIExamples/tree/master/specific_task/superaudit). That repository has no license file. This is a PowerShell reimplementation, not a copy of the Python source. Daemon mode, the historical database, and the web dashboard are not included.
+
 ## 0.4.1
 
 - Removed the legacy SNMP launcher (`Scale SNMP.cmd` and `ScaleSNMP.ps1`). Use `Scale API.cmd`.
