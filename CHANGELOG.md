@@ -5,6 +5,7 @@
 - SuperAudit tab. Read-only GET audit of the connected cluster: cluster, nodes, VMs (disks, network, snapshots, schedules, replication), drive health, ISOs, and active conditions.
 - Writes an HTML report and quoted CSV files into a timestamped folder next to the app, or into a folder you choose. Open report opens the HTML.
 - Endpoints that are missing on older HyperCore versions are skipped and listed in the report. The password and Authorization header are not logged or written into the report.
+- SuperAudit calls the same request helper as the other tabs. Paths are `/rest/v1/...` (a path that already starts with `/rest` is not prefixed again). A failed call, including Cluster, is logged, that section is marked skipped, and the audit continues. The request timeout is not sent as a JSON body.
 - The layout follows [Scale Computing's SuperAudit example](https://github.com/ScaleComputing/RestAPIExamples/tree/master/specific_task/superaudit). That repository has no license file. This is a PowerShell reimplementation, not a copy of the Python source. Daemon mode, the historical database, and the web dashboard are not included.
 
 ## 0.4.1

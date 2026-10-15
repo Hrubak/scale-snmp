@@ -319,6 +319,37 @@ Assert-Equal "fallback slot" $merged.DriveRows[0][1] "0"
 Assert-Equal "empty vm score" $merged.ComplianceScore "100.0"
 Assert-Equal "snap na" $merged.ComplianceRows[0][3] "N/A"
 
+$paths = Get-SaRequestPaths
+$pathCount = 0
+foreach ($prop in $paths.PSObject.Properties) {
+  $pathCount++
+  $p = [string]$prop.Value
+  $okPrefix = $p.StartsWith("/rest/v1/") -or $p.StartsWith("/rest/v2/")
+  Assert-True ("request path " + $prop.Name) $okPrefix
+  Assert-True ("no double rest " + $prop.Name) (-not $p.Contains("/rest/rest/"))
+  Assert-Equal ("normalized " + $prop.Name) (Get-HcApiPath $p) $p
+}
+Assert-True "path count" ($pathCount -ge 9)
+Assert-Equal "cluster path" $paths.Cluster "/rest/v1/Cluster"
+Assert-Equal "vm path" $paths.Vms "/rest/v1/VirDomain"
+Assert-Equal "node path" $paths.Nodes "/rest/v1/Node"
+Assert-Equal "v1 prefix once" (Get-HcApiPath "/v1/Cluster") "/rest/v1/Cluster"
+Assert-Equal "v2 prefix once" (Get-HcApiPath "/v2/SNMPConfig") "/rest/v2/SNMPConfig"
+Assert-Equal "update untouched" (Get-HcApiPath "/update/update_status.json") "/update/update_status.json"
+Assert-Equal "rest left alone" (Get-HcApiPath "/rest/v1/Node") "/rest/v1/Node"
+
+$apiSrc = [IO.File]::ReadAllText((Join-Path (Split-Path $PSScriptRoot -Parent) "ScaleAPI.ps1"))
+Assert-True "named timeout" ($apiSrc.Contains('Invoke-Hc -Method GET -Path $path -Body "" -TimeoutSec 120'))
+Assert-True "no positional body" (-not $apiSrc.Contains('Invoke-Hc GET $path 120'))
+
+$skippedReport = New-SaReport -Cluster $null -Nodes @() -Vms @() -SkippedSections @("Cluster", "Nodes", "VMs") `
+  -Notes @("Cluster skipped (HTTP 400). /rest/v1/Cluster") -CollectedAt "2026-10-15 12:00:00"
+Assert-True "cluster skipped" ($skippedReport.SummaryText.Contains("Cluster: skipped"))
+Assert-True "vms skipped" ($skippedReport.SummaryText.Contains("VMs processed: skipped"))
+Assert-True "nodes skipped" ($skippedReport.SummaryText.Contains("Nodes: skipped"))
+Assert-True "skip note kept" ($skippedReport.SummaryText.Contains("Cluster skipped (HTTP 400). /rest/v1/Cluster"))
+Assert-True "html skipped" ($skippedReport.Html.Contains("This section was skipped."))
+
 $srcFiles = @(
   (Join-Path (Split-Path $PSScriptRoot -Parent) "ScaleSuperAudit.ps1"),
   (Join-Path (Split-Path $PSScriptRoot -Parent) "ScaleAPI.ps1")

@@ -219,9 +219,10 @@ function Get-HcCurlProfiles {
 
 function Get-HcUrl([string]$Path) {
   $ip = $ipBox.Text.Trim()
-  if ($Path -match '^https?://') { return $Path }
-  if ($Path.StartsWith("/update/")) { return "https://$ip$Path" }
-  return "https://$ip/rest$Path"
+  # Same builder the VMs tab uses. /v1/VirDomain and /rest/v1/VirDomain both become https://host/rest/v1/VirDomain.
+  $apiPath = Get-HcApiPath $Path
+  if ($apiPath -match '^https?://') { return $apiPath }
+  return "https://$ip$apiPath"
 }
 
 function Invoke-HcCurlOnce {
@@ -1484,48 +1485,42 @@ $tabAudit.Controls.AddRange(@(
 ))
 $script:LastAuditHtml = ""
 
-function Get-SaFailureText([string]$label, $response, [bool]$required) {
-  $code = [string]$response.Code
-  if ($code -eq "000") {
-    $detail = Format-HcPublicError ([string]$response.Body)
-    if ($required) { return "$label failed. $detail" }
-    return "$label unavailable. $detail"
-  }
-  if ($code -eq "401" -or $code -eq "403") {
-    return "$label failed (HTTP $code). Check the login and password."
-  }
-  if ($required) { return "$label failed (HTTP $code)." }
-  return "$label unavailable (HTTP $code)."
-}
-
-function New-SaCallResult([bool]$ok, $items, [string]$note, [bool]$required) {
+function New-SaCallResult([bool]$ok, $items, [string]$note) {
   $list = New-Object System.Collections.ArrayList
   foreach ($item in (ConvertTo-SaArray $items)) {
     if ($null -ne $item) { [void]$list.Add($item) }
   }
-  return [pscustomobject]@{ Ok = $ok; Items = $list; Note = $note; Required = $required }
+  return [pscustomobject]@{ Ok = $ok; Items = $list; Note = $note }
 }
 
-function Invoke-SaGet([string]$label, [string]$path, [bool]$required) {
+function Invoke-SaGet([string]$label, [string]$path) {
+  # Same request helper as the VMs tab. Named parameters so the timeout is not sent as a JSON body.
+  $path = Get-HcApiPath $path
   Say "GET $path"
-  $response = Invoke-Hc GET $path 120
+  $response = Invoke-Hc -Method GET -Path $path -Body "" -TimeoutSec 120
   if ($response.Code -match '^2') {
     $trimmed = ""
     if ($response.Body) { $trimmed = $response.Body.Trim() }
     $parsed = ConvertFrom-HcJson $response.Body
     if ($null -eq $parsed) {
       if ($trimmed -eq "" -or $trimmed -eq "[]" -or $trimmed -eq "null") {
-        return (New-SaCallResult $true $null "" $required)
+        return (New-SaCallResult $true $null "")
       }
-      $note = "$label returned HTTP $($response.Code) but the body was not JSON."
-      if (-not $required) { Say $note }
-      return (New-SaCallResult $false $null $note $required)
+      $note = "$label skipped. HTTP $($response.Code) body was not JSON. $path"
+      Say $note
+      return (New-SaCallResult $false $null $note)
     }
-    return (New-SaCallResult $true $parsed "" $required)
+    return (New-SaCallResult $true $parsed "")
   }
-  $note = Get-SaFailureText $label $response $required
-  if (-not $required) { Say $note }
-  return (New-SaCallResult $false $null $note $required)
+  $code = [string]$response.Code
+  $note = "$label skipped (HTTP $code). $path"
+  if ($code -eq "000") {
+    $note = "$label skipped. $(Format-HcPublicError ([string]$response.Body)) $path"
+  } elseif ($code -eq "401" -or $code -eq "403") {
+    $note = "$label skipped (HTTP $code). Check the login and password. $path"
+  }
+  Say $note
+  return (New-SaCallResult $false $null $note)
 }
 
 function Start-SuperAudit {
@@ -1538,68 +1533,101 @@ function Start-SuperAudit {
   $started = Get-Date
   try {
     Say "SuperAudit started. Read-only GET. The password is not written to the log or the report."
+    $paths = Get-SaRequestPaths
     $notes = New-Object System.Collections.ArrayList
-    $clusterCall = Invoke-SaGet "Cluster" "/v1/Cluster" $true
-    if (-not $clusterCall.Ok) { throw [string]$clusterCall.Note }
+    $skipped = New-Object System.Collections.ArrayList
     $cluster = $null
-    if ($clusterCall.Items.Count -gt 0) { $cluster = $clusterCall.Items[0] }
-    if ($null -eq $cluster) { throw "Cluster response was empty." }
-
-    $nodeCall = Invoke-SaGet "Nodes" "/v1/Node" $true
-    if (-not $nodeCall.Ok) { throw [string]$nodeCall.Note }
-    $nodes = @($nodeCall.Items)
-
-    $vmCall = Invoke-SaGet "VMs" "/v1/VirDomain" $true
-    if (-not $vmCall.Ok) { throw [string]$vmCall.Note }
-    $vms = @($vmCall.Items)
-
-    $needDrives = $false
-    foreach ($node in $nodes) {
-      if ((ConvertTo-SaArray (Get-SaProp $node "drives")).Count -eq 0) { $needDrives = $true }
-    }
+    $nodes = @()
+    $vms = @()
     $extraDrives = @()
+    $repl = @()
+    $schedules = @()
+    $isos = @()
+    $conditions = @()
+
+    $clusterCall = Invoke-SaGet "Cluster" $paths.Cluster
+    if ($clusterCall.Ok) {
+      if ($clusterCall.Items.Count -gt 0) { $cluster = $clusterCall.Items[0] }
+    } else {
+      [void]$notes.Add([string]$clusterCall.Note)
+      [void]$skipped.Add("Cluster")
+    }
+
+    $nodeCall = Invoke-SaGet "Nodes" $paths.Nodes
+    if ($nodeCall.Ok) {
+      $nodes = @($nodeCall.Items)
+    } else {
+      [void]$notes.Add([string]$nodeCall.Note)
+      [void]$skipped.Add("Nodes")
+    }
+
+    $vmCall = Invoke-SaGet "VMs" $paths.Vms
+    if ($vmCall.Ok) {
+      $vms = @($vmCall.Items)
+    } else {
+      [void]$notes.Add([string]$vmCall.Note)
+      [void]$skipped.Add("VMs")
+    }
+
+    $needDrives = (-not $nodeCall.Ok)
+    if ($nodeCall.Ok) {
+      foreach ($node in $nodes) {
+        if ((ConvertTo-SaArray (Get-SaProp $node "drives")).Count -eq 0) { $needDrives = $true }
+      }
+    }
     if ($needDrives) {
-      $driveCall = Invoke-SaGet "Drives" "/v1/Drive" $false
+      $driveCall = Invoke-SaGet "Drives" $paths.Drives
       if ($driveCall.Ok) {
         $extraDrives = @($driveCall.Items)
-        [void]$notes.Add("Node records did not include drives. Drive rows use GET /v1/Drive.")
+        if ($nodeCall.Ok) {
+          [void]$notes.Add(("Node records did not include drives. Drive rows use {0}." -f $paths.Drives))
+        }
+      } else {
+        [void]$notes.Add([string]$driveCall.Note)
+        $embedded = $false
+        if ($nodeCall.Ok) {
+          foreach ($node in $nodes) {
+            if ((ConvertTo-SaArray (Get-SaProp $node "drives")).Count -gt 0) { $embedded = $true }
+          }
+        }
+        if (-not $embedded) { [void]$skipped.Add("Drives") }
       }
-      elseif ($driveCall.Note) { [void]$notes.Add([string]$driveCall.Note) }
     }
 
-    $replCall = Invoke-SaGet "Replication" "/v1/RemoteClusterConnection" $false
-    $repl = @()
+    $replCall = Invoke-SaGet "Replication" $paths.Replication
     if ($replCall.Ok) { $repl = @($replCall.Items) }
-    elseif ($replCall.Note) { [void]$notes.Add([string]$replCall.Note) }
+    else { [void]$notes.Add([string]$replCall.Note) }
 
-    $schedCall = Invoke-SaGet "Snapshot schedules" "/v1/VirDomainSnapshotSchedule" $false
-    $schedules = @()
+    $schedCall = Invoke-SaGet "Snapshot schedules" $paths.Schedules
     if ($schedCall.Ok) { $schedules = @($schedCall.Items) }
-    elseif ($schedCall.Note) { [void]$notes.Add([string]$schedCall.Note) }
+    else { [void]$notes.Add([string]$schedCall.Note) }
 
-    $isoCall = Invoke-SaGet "ISOs" "/v1/ISO" $false
-    $isos = @()
+    $isoCall = Invoke-SaGet "ISOs" $paths.Isos
     if ($isoCall.Ok) { $isos = @($isoCall.Items) }
-    elseif ($isoCall.Note) { [void]$notes.Add([string]$isoCall.Note) }
+    else {
+      [void]$notes.Add([string]$isoCall.Note)
+      [void]$skipped.Add("ISOs")
+    }
 
-    $condCall = Invoke-SaGet "Conditions" "/v1/Condition/filter?includeSet=true" $false
-    $conditions = @()
+    $condCall = Invoke-SaGet "Condition filter" $paths.ConditionFilter
     if ($condCall.Ok) {
       $conditions = @($condCall.Items)
     } else {
-      $condAll = Invoke-SaGet "Conditions" "/v1/Condition" $false
+      [void]$notes.Add([string]$condCall.Note)
+      $condAll = Invoke-SaGet "Conditions" $paths.Conditions
       if ($condAll.Ok) {
         $conditions = @($condAll.Items)
-        [void]$notes.Add("Condition filter is unavailable. Used /v1/Condition instead.")
-      } elseif ($condAll.Note) {
+        [void]$notes.Add(("Condition filter skipped. Used {0}." -f $paths.Conditions))
+      } else {
         [void]$notes.Add([string]$condAll.Note)
+        [void]$skipped.Add("Conditions")
       }
     }
 
-    Say ("Building SuperAudit report for {0} VM(s) and {1} node(s)." -f $vms.Count, $nodes.Count)
+    Say "Building SuperAudit report. A skipped endpoint does not stop the rest of the audit."
     $report = New-SaReport -Cluster $cluster -Nodes $nodes -Vms $vms -Replication $repl `
       -Schedules $schedules -Isos $isos -Conditions $conditions -ExtraDrives $extraDrives `
-      -Notes @($notes) -CollectedAt (Get-Date -Format "yyyy-MM-dd HH:mm:ss") `
+      -Notes @($notes) -SkippedSections @($skipped) -CollectedAt (Get-Date -Format "yyyy-MM-dd HH:mm:ss") `
       -ElapsedSeconds ((Get-Date) - $started).TotalSeconds -ToolVersion $script:AppVersion
     if (-not (Test-Path -LiteralPath $folder)) {
       New-Item -ItemType Directory -Path $folder -Force | Out-Null

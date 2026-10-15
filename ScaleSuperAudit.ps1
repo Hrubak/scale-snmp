@@ -388,6 +388,7 @@ function New-SaReport {
     $Conditions,
     $ExtraDrives,
     [string[]]$Notes,
+    [string[]]$SkippedSections,
     [string]$CollectedAt = "",
     [double]$ElapsedSeconds = 0,
     [string]$ToolVersion = "0.5.0"
@@ -886,6 +887,15 @@ function New-SaReport {
     $snapPct = ([double]$vmsWithSnaps / [double]$totalVms) * 100
   }
   $elapsedText = Format-SaElapsed $ElapsedSeconds
+  $skipSet = @{}
+  foreach ($section in (ConvertTo-SaArray $SkippedSections)) {
+    if ($section) { $skipSet[[string]$section] = $true }
+  }
+  if ($skipSet.ContainsKey("Cluster")) {
+    $clusterName = "skipped"
+    $company = "skipped"
+    $icos = "skipped"
+  }
   $summary = New-Object System.Text.StringBuilder
   [void]$summary.AppendLine("SUPERAUDIT SUMMARY")
   [void]$summary.AppendLine(("Generated: {0}" -f $CollectedAt))
@@ -897,10 +907,14 @@ function New-SaReport {
   [void]$summary.AppendLine(("ICOS version: {0}" -f $icos))
   [void]$summary.AppendLine(("Collection time: {0}" -f $elapsedText))
   [void]$summary.AppendLine("")
-  [void]$summary.AppendLine(("VMs processed: {0}" -f $totalVms))
-  [void]$summary.AppendLine(("  Running: {0} ({1}%)" -f $runningVms, (Format-SaPct1 $runningPct)))
-  [void]$summary.AppendLine(("  Stopped: {0} ({1}%)" -f $stoppedVms, (Format-SaPct1 $stoppedPct)))
-  [void]$summary.AppendLine(("Memory allocated: {0} GB" -f (Format-SaNum1 $memoryGbSum)))
+  if ($skipSet.ContainsKey("VMs")) {
+    [void]$summary.AppendLine("VMs processed: skipped")
+  } else {
+    [void]$summary.AppendLine(("VMs processed: {0}" -f $totalVms))
+    [void]$summary.AppendLine(("  Running: {0} ({1}%)" -f $runningVms, (Format-SaPct1 $runningPct)))
+    [void]$summary.AppendLine(("  Stopped: {0} ({1}%)" -f $stoppedVms, (Format-SaPct1 $stoppedPct)))
+    [void]$summary.AppendLine(("Memory allocated: {0} GB" -f (Format-SaNum1 $memoryGbSum)))
+  }
   [void]$summary.AppendLine("")
   [void]$summary.AppendLine(("Storage allocated: {0} TB" -f $capTbText))
   [void]$summary.AppendLine(("Storage used: {0} TB ({1}%)" -f $usedTbText, (Format-SaPct1 $storagePct)))
@@ -908,10 +922,18 @@ function New-SaReport {
   [void]$summary.AppendLine(("VMs with snapshots: {0} ({1}%)" -f $vmsWithSnaps, (Format-SaPct1 $snapPct)))
   [void]$summary.AppendLine(("VMs without snapshots: {0}" -f $vmsWithoutSnaps))
   [void]$summary.AppendLine("")
-  [void]$summary.AppendLine(("Nodes: {0} ({1} online, {2} offline)" -f $nodeItems.Count, $nodesOnline, $nodesOffline))
-  [void]$summary.AppendLine(("Drives: {0} ({1} SSD, {2} HDD)" -f $totalDrives, $ssdDrives, $hddDrives))
-  [void]$summary.AppendLine(("Healthy drives: {0}" -f $healthyDrives))
-  [void]$summary.AppendLine(("Unhealthy drives: {0}" -f $unhealthyDrives))
+  if ($skipSet.ContainsKey("Nodes")) {
+    [void]$summary.AppendLine("Nodes: skipped")
+  } else {
+    [void]$summary.AppendLine(("Nodes: {0} ({1} online, {2} offline)" -f $nodeItems.Count, $nodesOnline, $nodesOffline))
+  }
+  if ($skipSet.ContainsKey("Drives")) {
+    [void]$summary.AppendLine("Drives: skipped")
+  } else {
+    [void]$summary.AppendLine(("Drives: {0} ({1} SSD, {2} HDD)" -f $totalDrives, $ssdDrives, $hddDrives))
+    [void]$summary.AppendLine(("Healthy drives: {0}" -f $healthyDrives))
+    [void]$summary.AppendLine(("Unhealthy drives: {0}" -f $unhealthyDrives))
+  }
   [void]$summary.AppendLine("")
   [void]$summary.AppendLine(("Compliance score: {0}" -f $scoreText))
   foreach ($comp in @($complianceRows)) {
@@ -968,12 +990,16 @@ function New-SaReport {
   [void]$html.AppendLine((ConvertTo-SaHtmlText $summaryText))
   [void]$html.AppendLine("</pre>")
   [void]$html.AppendLine("<div id=`"vms`">")
+  if ($skipSet.ContainsKey("VMs")) { [void]$html.AppendLine("<p class=`"note`">This section was skipped.</p>") }
   [void]$html.Append((Format-SaHtmlTable "VM Inventory" $vmHeaders $vmRows))
   [void]$html.AppendLine("</div><div id=`"nodes`">")
+  if ($skipSet.ContainsKey("Nodes")) { [void]$html.AppendLine("<p class=`"note`">This section was skipped.</p>") }
   [void]$html.Append((Format-SaHtmlTable "Node Hardware" $nodeHeaders $nodeRows))
   [void]$html.AppendLine("</div><div id=`"drives`">")
+  if ($skipSet.ContainsKey("Drives")) { [void]$html.AppendLine("<p class=`"note`">This section was skipped.</p>") }
   [void]$html.Append((Format-SaHtmlTable "Drive Health" $driveHeaders $driveRows))
   [void]$html.AppendLine("</div><div id=`"isos`">")
+  if ($skipSet.ContainsKey("ISOs")) { [void]$html.AppendLine("<p class=`"note`">This section was skipped.</p>") }
   [void]$html.Append((Format-SaHtmlTable "ISO Library" $isoHeaders $isoRows))
   [void]$html.AppendLine("</div><div id=`"warnings`">")
   [void]$html.Append((Format-SaHtmlTable "Warnings and Recommendations" $warningHeaders $warningRows))
@@ -984,6 +1010,7 @@ function New-SaReport {
   [void]$html.Append((Format-SaHtmlTable "Capacity Planning" $capacityHeaders $capacityRows))
   [void]$html.AppendLine("<p class=`"note`">Storage totals follow the example: bytes on drives whose disposition is IN, divided by 1024^3, then shown as TB by dividing that figure by 1000. Node Hardware capacity uses each node's capacity field and decimal TB (1000^4). The upstream workbook writer does not emit this sheet.</p>")
   [void]$html.AppendLine("</div><div id=`"conditions`">")
+  if ($skipSet.ContainsKey("Conditions")) { [void]$html.AppendLine("<p class=`"note`">This section was skipped.</p>") }
   [void]$html.Append((Format-SaHtmlTable "Active Conditions" $conditionHeaders $conditionRows))
   [void]$html.AppendLine("<p class=`"note`">Active conditions come from GET /rest/v1/Condition (value true). The example daemon stores them. The one-time workbook does not.</p>")
   [void]$html.AppendLine("</div>")
@@ -1063,5 +1090,31 @@ function Export-SaReport {
     Directory = $dir
     HtmlPath = $htmlPath
     CsvPaths = $csvPaths
+  }
+}
+
+function Get-HcApiPath([string]$Path) {
+  # Final path on the host. VMs pass /v1/VirDomain. SuperAudit passes /rest/v1/Cluster.
+  # Both must request /rest/v1/... exactly once. /update/ is outside /rest.
+  if ($null -eq $Path) { return "" }
+  if ($Path -match '^https?://') { return $Path }
+  if ($Path.StartsWith("/update/")) { return $Path }
+  if ($Path.StartsWith("/rest/") -or $Path -eq "/rest") { return $Path }
+  if (-not $Path.StartsWith("/")) { $Path = "/" + $Path }
+  return "/rest" + $Path
+}
+
+function Get-SaRequestPaths {
+  # Every path SuperAudit passes to Invoke-Hc. Keep this list complete.
+  return [pscustomobject]@{
+    Cluster = "/rest/v1/Cluster"
+    Nodes = "/rest/v1/Node"
+    Vms = "/rest/v1/VirDomain"
+    Drives = "/rest/v1/Drive"
+    Replication = "/rest/v1/RemoteClusterConnection"
+    Schedules = "/rest/v1/VirDomainSnapshotSchedule"
+    Isos = "/rest/v1/ISO"
+    ConditionFilter = "/rest/v1/Condition/filter?includeSet=true"
+    Conditions = "/rest/v1/Condition"
   }
 }
