@@ -1,13 +1,66 @@
-# Scale HyperCore API Toolkit — Windows UI for SC//HyperCore REST (v1 + SNMP v2).
-# Uses curl.exe because Windows PowerShell 5.1 TLS fails against HyperCore self-signed certs.
-# Credentials stay in memory for the session only; never written to the log.
+﻿# Scale HyperCore API Toolkit 0.4 - Windows UI for SC//HyperCore REST (v1 + SNMP v2).
+# Schannel curl (TLS 1.3, then default, then TLS 1.0-1.1) and .NET run first.
+# HyperCore 9.7.11 is TLS 1.3 only (TLS_AES_256_GCM_SHA384). Windows 10 Schannel
+# fails with SEC_E_ALGORITHM_MISMATCH before the handshake. Git curl is Schannel too.
+# Fallback is openssl s_client (Git usr\bin\openssl.exe, SCALE_OPENSSL, or ScaleAPI-openssl.path).
+# Credentials stay in memory and are never logged. The Authorization header is never logged.
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
+$script:AppVersion = "0.4"
 $script:AppTitle = "Scale HyperCore API"
 $logFile = Join-Path $PSScriptRoot "ScaleAPI-log.txt"
 $script:VmCache = @()
 $script:NodeCache = @()
+$script:Transport = $null
+$script:CurlProfileLabel = $null
+$script:CurlProfileArgs = @()
+$script:HcDotNetProtoLabel = "TLS 1.0, TLS 1.1, TLS 1.2"
+$script:HcDotNetTls13 = $false
+
+# Self-signed HyperCore certs. The callback is for the .NET fallback only.
+if (-not ("HcTrustAll" -as [type])) {
+  Add-Type @"
+using System.Net;
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
+public static class HcTrustAll {
+  public static bool Allow(object sender, X509Certificate cert, X509Chain chain, SslPolicyErrors errors) { return true; }
+  public static void Enable() {
+    ServicePointManager.ServerCertificateValidationCallback = Allow;
+  }
+}
+"@
+}
+[HcTrustAll]::Enable()
+
+function Set-HcDotNetProtocols {
+  # Prefer TLS 1.3 (enum value 12288) plus Tls12 | Tls11 | Tls. Fall back if 12288 is rejected.
+  $base = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls
+  $script:HcDotNetTls13 = $false
+  $chosen = $base
+  try {
+    $with13 = $base -bor ([Net.SecurityProtocolType]12288)
+    [Net.ServicePointManager]::SecurityProtocol = $with13
+    $current = [int][Net.ServicePointManager]::SecurityProtocol
+    if (($current -band 12288) -eq 12288) {
+      $script:HcDotNetTls13 = $true
+      $chosen = $with13
+    }
+  } catch {
+    $script:HcDotNetTls13 = $false
+  }
+  if (-not $script:HcDotNetTls13) {
+    try { [Net.ServicePointManager]::SecurityProtocol = $base } catch {}
+    $chosen = $base
+    $script:HcDotNetProtoLabel = "TLS 1.2, TLS 1.1, TLS 1.0 (TLS 1.3 value 12288 was rejected by this runtime)"
+  } else {
+    $script:HcDotNetProtoLabel = "TLS 1.3 (12288), TLS 1.2, TLS 1.1, TLS 1.0"
+  }
+  return $chosen
+}
+
+Set-HcDotNetProtocols | Out-Null
 
 # --- helpers: UI factories ---
 function New-Label([string]$text, [int]$x, [int]$y, [int]$w = 110, [int]$h = 22) {
@@ -37,7 +90,7 @@ function New-Grid([int]$x, [int]$y, [int]$w, [int]$h) {
 
 # --- main form ---
 $form = New-Object Windows.Forms.Form
-$form.Text = $script:AppTitle
+$form.Text = "$($script:AppTitle) $($script:AppVersion)"
 $form.Size = New-Object Drawing.Size(920, 680)
 $form.StartPosition = "CenterScreen"
 $form.MinimumSize = New-Object Drawing.Size(800, 560)
@@ -51,11 +104,12 @@ $passBox = New-TextBox 380 42 160 $true
 $connStatus = New-Label "Not connected" 560 42 320 22
 $connStatus.ForeColor = [Drawing.Color]::DimGray
 $connectBtn = New-Button "Connect" 560 10 100 28
+$testTlsBtn = New-Button "Test TLS" 670 10 100 28
 $connPanel.Controls.AddRange(@(
   (New-Label "Cluster IP / host" 12 12 108), $ipBox,
   (New-Label "Login" 12 42 108), $userBox,
   (New-Label "Password" 280 42 90), $passBox,
-  $connectBtn, $connStatus
+  $connectBtn, $testTlsBtn, $connStatus
 ))
 
 # Tabs + shared log
@@ -93,6 +147,603 @@ function Test-Credentials {
   return $true
 }
 
+function Format-HcPublicError([string]$text) {
+  if (-not $text) { return "" }
+  $clean = $text -replace '(?i)Authorization:\s*Basic\s+\S+', 'Authorization: Basic [redacted]'
+  $clean = $clean -replace '(?i)(password|communityName)"?\s*[:=]\s*"?[^",\s]+', '$1=[redacted]'
+  $clean = ($clean -replace '[\r\n]+', ' ').Trim()
+  if ($clean.Length -gt 400) { $clean = $clean.Substring(0, 400) + "..." }
+  return $clean
+}
+
+function Get-HcExceptionText($err) {
+  $ex = $null
+  if ($err -and $err.Exception) { $ex = $err.Exception } elseif ($err) { $ex = $err }
+  $parts = @()
+  $guard = 0
+  while ($ex -and $guard -lt 6) {
+    if ($ex.Message) { $parts += [string]$ex.Message }
+    $ex = $ex.InnerException
+    $guard++
+  }
+  return ($parts -join " | ")
+}
+
+function Test-HcTlsFailure([int]$exitCode, [string]$text) {
+  if ($exitCode -in 35, 51, 53, 54, 58, 59, 60, 66, 77, 80, 82, 83, 90, 91) { return $true }
+  if ($text -match '(?i)schannel|SEC_E_|SSL|TLS|secure channel|InitializeSecurityContext|certificate') { return $true }
+  if ($exitCode -eq 2 -and $text -match '(?i)option|unknown|tls|ssl') { return $true }
+  return $false
+}
+
+function Split-HcCurlRaw([string]$raw) {
+  $code = "000"
+  $match = [regex]::Match($raw, '__HC_HTTP_(\d{3})__')
+  if ($match.Success) { $code = $match.Groups[1].Value }
+  $body = [regex]::Replace($raw, '__HC_HTTP_\d{3}__', '')
+  [pscustomobject]@{ Code = $code; Body = $body.Trim() }
+}
+
+function Get-HcNegotiatedTls([string]$text) {
+  if (-not $text) { return "" }
+  if ($text -match '(?i)TLSv1\.3|TLS[\s/]*1\.3') { return "TLS 1.3" }
+  if ($text -match '(?i)TLSv1\.2|TLS[\s/]*1\.2') { return "TLS 1.2" }
+  if ($text -match '(?i)TLSv1\.1|TLS[\s/]*1\.1') { return "TLS 1.1" }
+  if ($text -match '(?i)TLSv1\.0|TLS[\s/]*1\.0|(?<![\d\.])TLSv1(?![\d\.])') { return "TLS 1.0" }
+  return ""
+}
+
+function ConvertTo-HcProtoLabel([string]$name) {
+  switch ($name) {
+    "Tls13" { return "TLS 1.3" }
+    "Tls12" { return "TLS 1.2" }
+    "Tls11" { return "TLS 1.1" }
+    "Tls" { return "TLS 1.0" }
+    "None" { return "none" }
+    default { return $name }
+  }
+}
+
+function Get-HcCurlProfiles {
+  # TLS 1.3 first. HyperCore 9.7.11 can fail a TLS 1.2 pin with SEC_E_UNSUPPORTED_FUNCTION.
+  # Default is next (works for 9.7.10). TLS 1.0-1.1 is last and unlikely on 9.7.11.
+  @(
+    @{ Label = "TLS 1.3"; Args = @("--tlsv1.3") },
+    @{ Label = "default"; Args = @() },
+    @{ Label = "TLS 1.0-1.1"; Args = @("--tlsv1.0", "--tls-max", "1.1") }
+  )
+}
+
+function Get-HcUrl([string]$Path) {
+  $ip = $ipBox.Text.Trim()
+  if ($Path -match '^https?://') { return $Path }
+  if ($Path.StartsWith("/update/")) { return "https://$ip$Path" }
+  return "https://$ip/rest$Path"
+}
+
+function Invoke-HcCurlOnce {
+  param(
+    [string]$Method,
+    [string]$Url,
+    [string]$Body,
+    [int]$TimeoutSec,
+    [string[]]$TlsArgs,
+    [switch]$Anonymous,
+    [switch]$CaptureTrace
+  )
+  $cfg = $null
+  $bf = $null
+  $exitCode = 1
+  $raw = ""
+  try {
+    $ca = @("-sS", "-k", "--ssl-no-revoke")
+    if ($TlsArgs) { $ca += @($TlsArgs) }
+    $ca += @(
+      "--max-time", "$TimeoutSec",
+      "-X", $Method,
+      "-w", "`n__HC_HTTP_%{http_code}__"
+    )
+    if ($CaptureTrace) { $ca += "--verbose" }
+    if (-not $Anonymous) {
+      $cfg = [IO.Path]::GetTempFileName()
+      $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($userBox.Text.Trim() + ":" + $passBox.Text))
+      Set-Content -Path $cfg -Value "header = `"Authorization: Basic $b64`"" -Encoding ASCII
+      $ca += @("-K", $cfg)
+    }
+    if ($Body) {
+      $bf = [IO.Path]::GetTempFileName()
+      [IO.File]::WriteAllText($bf, $Body)
+      $ca += @("-H", "Content-Type: application/json", "--data-binary", "@$bf")
+    }
+    $ca += $Url
+    $raw = (& curl.exe @ca 2>&1) -join "`n"
+    if ($null -ne $LASTEXITCODE) { $exitCode = [int]$LASTEXITCODE }
+  } catch {
+    $raw = Get-HcExceptionText $_
+    $exitCode = 1
+  } finally {
+    if ($cfg) { Remove-Item $cfg -Force -ErrorAction SilentlyContinue }
+    if ($bf) { Remove-Item $bf -Force -ErrorAction SilentlyContinue }
+  }
+  $split = Split-HcCurlRaw $raw
+  $ok = ($exitCode -eq 0 -and $split.Code -match '^\d{3}$' -and $split.Code -ne "000")
+  [pscustomobject]@{ Ok = $ok; Code = $split.Code; Body = $split.Body; Exit = $exitCode }
+}
+
+function Invoke-HcDotNet {
+  param(
+    [string]$Method,
+    [string]$Url,
+    [string]$Body,
+    [int]$TimeoutSec,
+    [switch]$Anonymous
+  )
+  Set-HcDotNetProtocols | Out-Null
+  $resp = $null
+  try {
+    $req = [Net.HttpWebRequest]::Create($Url)
+    $req.Method = $Method
+    $req.Timeout = $TimeoutSec * 1000
+    $req.ReadWriteTimeout = $TimeoutSec * 1000
+    $req.Accept = "application/json"
+    $req.UserAgent = "ScaleHyperCoreAPIToolkit/$($script:AppVersion)"
+    if (-not $Anonymous) {
+      $token = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($userBox.Text.Trim() + ":" + $passBox.Text))
+      $req.Headers.Add("Authorization", "Basic $token")
+    }
+    if ($Body -and $Method -in @("POST", "PATCH", "PUT")) {
+      $bytes = [Text.Encoding]::UTF8.GetBytes($Body)
+      $req.ContentType = "application/json"
+      $req.ContentLength = $bytes.Length
+      $stream = $req.GetRequestStream()
+      try { $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Close() }
+    }
+    $resp = $req.GetResponse()
+    $sr = New-Object IO.StreamReader($resp.GetResponseStream())
+    try { $text = $sr.ReadToEnd() } finally { $sr.Close() }
+    $code = [int]$resp.StatusCode
+    return [pscustomobject]@{ Ok = $true; Code = "$code"; Body = $text; Exit = 0 }
+  } catch [Net.WebException] {
+    $ex = $_.Exception
+    $respErr = $ex.Response
+    if ($respErr) {
+      try {
+        $sr = New-Object IO.StreamReader($respErr.GetResponseStream())
+        try { $text = $sr.ReadToEnd() } finally { $sr.Close() }
+        $code = [int]$respErr.StatusCode
+        return [pscustomobject]@{ Ok = $true; Code = "$code"; Body = $text; Exit = 0 }
+      } catch {
+        return [pscustomobject]@{ Ok = $false; Code = "000"; Body = (Get-HcExceptionText $_); Exit = 1 }
+      } finally {
+        $respErr.Close()
+      }
+    }
+    return [pscustomobject]@{ Ok = $false; Code = "000"; Body = (Get-HcExceptionText $_); Exit = 1 }
+  } catch {
+    return [pscustomobject]@{ Ok = $false; Code = "000"; Body = (Get-HcExceptionText $_); Exit = 1 }
+  } finally {
+    if ($resp) { $resp.Close() }
+  }
+}
+
+function Invoke-HcCurlLadder {
+  param(
+    [string]$Method,
+    [string]$Url,
+    [string]$Body,
+    [int]$TimeoutSec,
+    [switch]$OnlyRemembered,
+    [string]$SkipLabel
+  )
+  $profiles = @(Get-HcCurlProfiles)
+  if ($OnlyRemembered -and $script:CurlProfileLabel) {
+    $profiles = @($profiles | Where-Object { $_.Label -eq $script:CurlProfileLabel })
+  }
+  if (-not $script:LoggedCurlExe) {
+    $script:LoggedCurlExe = $true
+    Say ("Using schannel curl: {0}" -f (Get-HcCurlExe))
+  }
+  $notes = @()
+  $last = $null
+  foreach ($tlsProfile in $profiles) {
+    if ($SkipLabel -and $tlsProfile.Label -eq $SkipLabel) { continue }
+    $tlsArgs = @()
+    if ($tlsProfile.Args) { $tlsArgs = @($tlsProfile.Args) }
+    $r = Invoke-HcCurlOnce -Method $Method -Url $Url -Body $Body -TimeoutSec $TimeoutSec -TlsArgs $tlsArgs
+    $last = $r
+    if ($r.Ok) {
+      $changed = ($script:Transport -ne "curl" -or $script:CurlProfileLabel -ne $tlsProfile.Label)
+      $script:Transport = "curl"
+      $script:CurlProfileLabel = [string]$tlsProfile.Label
+      $script:CurlProfileArgs = $tlsArgs
+      if ($changed) { Say ("Using curl TLS profile: {0}" -f $tlsProfile.Label) }
+      return [pscustomobject]@{ Ok = $true; Code = $r.Code; Body = $r.Body; TlsFailure = $false; Attempts = $notes }
+    }
+    $tls = Test-HcTlsFailure ([int]$r.Exit) ([string]$r.Body)
+    $note = "curl $($tlsProfile.Label) exit $($r.Exit)"
+    $notes += $note
+    $public = Format-HcPublicError $r.Body
+    if ($tls) {
+      Say ("curl TLS/connect failed ({0}, exit {1}): {2}" -f $tlsProfile.Label, $r.Exit, $public)
+    } else {
+      Say ("curl failed ({0}, exit {1}): {2}" -f $tlsProfile.Label, $r.Exit, $public)
+      return [pscustomobject]@{ Ok = $false; Code = "000"; Body = $public; TlsFailure = $false; Attempts = $notes }
+    }
+  }
+  $tail = ""
+  if ($last) { $tail = Format-HcPublicError $last.Body }
+  [pscustomobject]@{ Ok = $false; Code = "000"; Body = $tail; TlsFailure = $true; Attempts = $notes }
+}
+
+function Get-HcCurlExe {
+  $cmd = Get-Command curl.exe -ErrorAction SilentlyContinue
+  if ($cmd -and $cmd.Source) { return [string]$cmd.Source }
+  return "curl.exe"
+}
+
+function Find-HcOpenSsl {
+  # Git for Windows ships a real OpenSSL at usr\bin\openssl.exe. Its curl.exe is Schannel-only.
+  $candidates = @()
+  if ($env:SCALE_OPENSSL) { $candidates += $env:SCALE_OPENSSL.Trim().Trim('"') }
+  if ($PSScriptRoot) {
+    $pathFile = Join-Path $PSScriptRoot "ScaleAPI-openssl.path"
+    if (Test-Path -LiteralPath $pathFile) {
+      $line = @(Get-Content -LiteralPath $pathFile -TotalCount 1 -ErrorAction SilentlyContinue)
+      if ($line.Count -gt 0 -and $line[0]) { $candidates += ([string]$line[0]).Trim().Trim('"') }
+    }
+  }
+  $roots = @()
+  if ($env:ProgramFiles) { $roots += $env:ProgramFiles }
+  if (${env:ProgramFiles(x86)}) { $roots += ${env:ProgramFiles(x86)} }
+  foreach ($root in $roots) {
+    $candidates += (Join-Path $root "Git\usr\bin\openssl.exe")
+    $candidates += (Join-Path $root "Git\mingw64\bin\openssl.exe")
+    $candidates += (Join-Path $root "OpenSSL-Win64\bin\openssl.exe")
+  }
+  if ($env:LOCALAPPDATA) {
+    $candidates += (Join-Path $env:LOCALAPPDATA "Programs\Git\usr\bin\openssl.exe")
+  }
+  foreach ($c in $candidates) {
+    if ($c -and (Test-Path -LiteralPath $c)) {
+      $resolved = Resolve-Path -LiteralPath $c
+      return [string]$resolved.Path
+    }
+  }
+  $cmd = Get-Command openssl.exe -ErrorAction SilentlyContinue
+  if ($cmd -and $cmd.Source -and (Test-Path -LiteralPath $cmd.Source)) { return [string]$cmd.Source }
+  return $null
+}
+
+function Find-HcByteSeq([byte[]]$data, [byte[]]$pattern, [int]$start) {
+  if (-not $data -or -not $pattern -or $pattern.Length -eq 0) { return -1 }
+  $last = $data.Length - $pattern.Length
+  for ($i = $start; $i -le $last; $i++) {
+    $ok = $true
+    for ($j = 0; $j -lt $pattern.Length; $j++) {
+      if ($data[$i + $j] -ne $pattern[$j]) { $ok = $false; break }
+    }
+    if ($ok) { return $i }
+  }
+  return -1
+}
+
+function ConvertFrom-HcChunkedBytes([byte[]]$data) {
+  $ms = New-Object IO.MemoryStream
+  $complete = $false
+  if (-not $data) { return [pscustomobject]@{ Bytes = (New-Object byte[] 0); Complete = $false } }
+  $i = 0
+  $crlf = [byte[]](13, 10)
+  while ($i -lt $data.Length) {
+    $lineEnd = Find-HcByteSeq $data $crlf $i
+    if ($lineEnd -lt 0) { break }
+    $line = [Text.Encoding]::ASCII.GetString($data, $i, ($lineEnd - $i)).Trim()
+    $semi = $line.IndexOf(";")
+    if ($semi -ge 0) { $line = $line.Substring(0, $semi).Trim() }
+    $size = 0
+    $parsed = [int]::TryParse($line, [Globalization.NumberStyles]::AllowHexSpecifier, [Globalization.CultureInfo]::InvariantCulture, [ref]$size)
+    if (-not $parsed) { break }
+    $i = $lineEnd + 2
+    if ($size -le 0) { $complete = $true; break }
+    if (($i + $size) -gt $data.Length) { break }
+    $ms.Write($data, $i, $size)
+    $i += $size
+    if (($i + 1) -lt $data.Length -and $data[$i] -eq 13 -and $data[$i + 1] -eq 10) { $i += 2 }
+  }
+  return [pscustomobject]@{ Bytes = $ms.ToArray(); Complete = $complete }
+}
+
+function ConvertFrom-HcHttpBytes([byte[]]$data) {
+  $empty = [pscustomobject]@{ Ok = $false; Code = "000"; Body = ""; Complete = $false }
+  if (-not $data -or $data.Length -eq 0) { return $empty }
+  $marker = [Text.Encoding]::ASCII.GetBytes("HTTP/1.")
+  $start = Find-HcByteSeq $data $marker 0
+  if ($start -lt 0) { return $empty }
+  $sep = [byte[]](13, 10, 13, 10)
+  $hdrEnd = Find-HcByteSeq $data $sep $start
+  $sepLen = 4
+  if ($hdrEnd -lt 0) {
+    $sep = [byte[]](10, 10)
+    $hdrEnd = Find-HcByteSeq $data $sep $start
+    $sepLen = 2
+  }
+  if ($hdrEnd -lt 0) { return $empty }
+  $headerText = [Text.Encoding]::ASCII.GetString($data, $start, ($hdrEnd - $start))
+  $bodyStart = $hdrEnd + $sepLen
+  $bodyLen = $data.Length - $bodyStart
+  $bodyBytes = New-Object byte[] 0
+  if ($bodyLen -gt 0) {
+    $bodyBytes = New-Object byte[] $bodyLen
+    [Array]::Copy($data, $bodyStart, $bodyBytes, 0, $bodyLen)
+  }
+  $lines = @($headerText -split "`r?`n")
+  $code = "000"
+  if ($lines.Count -gt 0 -and $lines[0] -match 'HTTP/1\.[01]\s+(\d{3})') { $code = $Matches[1] } else { return $empty }
+  $chunked = $false
+  $contentLength = -1
+  foreach ($line in ($lines | Select-Object -Skip 1)) {
+    $colon = $line.IndexOf(":")
+    if ($colon -lt 1) { continue }
+    $name = $line.Substring(0, $colon).Trim().ToLower()
+    $value = $line.Substring($colon + 1).Trim()
+    if ($name -eq "transfer-encoding" -and $value -match '(?i)chunked') { $chunked = $true }
+    if ($name -eq "content-length") {
+      $n = 0
+      if ([int]::TryParse($value, [ref]$n)) { $contentLength = $n }
+    }
+  }
+  $complete = $false
+  if ($chunked) {
+    $decoded = ConvertFrom-HcChunkedBytes $bodyBytes
+    $bodyBytes = $decoded.Bytes
+    $complete = [bool]$decoded.Complete
+  } elseif ($contentLength -ge 0) {
+    if ($bodyBytes.Length -ge $contentLength) {
+      if ($contentLength -eq 0) {
+        $bodyBytes = New-Object byte[] 0
+      } else {
+        $exact = New-Object byte[] $contentLength
+        [Array]::Copy($bodyBytes, 0, $exact, 0, $contentLength)
+        $bodyBytes = $exact
+      }
+      $complete = $true
+    }
+  }
+  $bodyText = [Text.Encoding]::UTF8.GetString($bodyBytes)
+  return [pscustomobject]@{ Ok = $true; Code = $code; Body = $bodyText; Complete = $complete }
+}
+
+function Split-HcRequestUrl([string]$Url) {
+  $uri = [Uri]$Url
+  $port = [int]$uri.Port
+  if ($port -le 0) { $port = 443 }
+  $path = [string]$uri.PathAndQuery
+  if (-not $path) { $path = "/" }
+  $hostHeader = [string]$uri.Host
+  if ($port -ne 443) { $hostHeader = "$($uri.Host):$port" }
+  return [pscustomobject]@{ Host = [string]$uri.Host; Port = $port; Path = $path; HostHeader = $hostHeader }
+}
+
+function New-HcRawHttpBytes([string]$Method, [string]$HostHeader, [string]$PathQuery, [string]$Body, [string]$BasicToken) {
+  # BasicToken is written only into the request bytes. Callers must not log this string.
+  $header = New-Object Text.StringBuilder
+  [void]$header.Append("$Method $PathQuery HTTP/1.1`r`n")
+  [void]$header.Append("Host: $HostHeader`r`n")
+  [void]$header.Append("User-Agent: ScaleHyperCoreAPIToolkit/$($script:AppVersion)`r`n")
+  [void]$header.Append("Accept: application/json`r`n")
+  [void]$header.Append("Connection: close`r`n")
+  if ($BasicToken) { [void]$header.Append("Authorization: Basic $BasicToken`r`n") }
+  $payload = $null
+  if ($Body -and $Method -in @("POST", "PATCH", "PUT", "DELETE")) {
+    $payload = [Text.Encoding]::UTF8.GetBytes($Body)
+    [void]$header.Append("Content-Type: application/json`r`n")
+    [void]$header.Append("Content-Length: $($payload.Length)`r`n")
+  }
+  [void]$header.Append("`r`n")
+  $head = [Text.Encoding]::ASCII.GetBytes($header.ToString())
+  if (-not $payload) { return $head }
+  $all = New-Object byte[] ($head.Length + $payload.Length)
+  [Buffer]::BlockCopy($head, 0, $all, 0, $head.Length)
+  [Buffer]::BlockCopy($payload, 0, $all, $head.Length, $payload.Length)
+  return $all
+}
+
+function Receive-HcProcessBytes([System.Diagnostics.Process]$Proc, [int]$TimeoutMs) {
+  $outMs = New-Object IO.MemoryStream
+  $errMs = New-Object IO.MemoryStream
+  $outBuf = New-Object byte[] 8192
+  $errBuf = New-Object byte[] 4096
+  $outStream = $Proc.StandardOutput.BaseStream
+  $errStream = $Proc.StandardError.BaseStream
+  $outPending = $null
+  $errPending = $null
+  try { $outPending = $outStream.BeginRead($outBuf, 0, $outBuf.Length, $null, $null) } catch { $outPending = $null }
+  try { $errPending = $errStream.BeginRead($errBuf, 0, $errBuf.Length, $null, $null) } catch { $errPending = $null }
+  $sw = [Diagnostics.Stopwatch]::StartNew()
+  $timedOut = $false
+  while ($true) {
+    if ($outPending -and $outPending.IsCompleted) {
+      try {
+        $n = $outStream.EndRead($outPending)
+        if ($n -gt 0) {
+          $outMs.Write($outBuf, 0, $n)
+          $parsedNow = ConvertFrom-HcHttpBytes $outMs.ToArray()
+          if ($parsedNow.Complete -and -not $Proc.HasExited) {
+            try { $Proc.Kill() } catch {}
+          }
+          $outPending = $outStream.BeginRead($outBuf, 0, $outBuf.Length, $null, $null)
+        } else { $outPending = $null }
+      } catch { $outPending = $null }
+    }
+    if ($errPending -and $errPending.IsCompleted) {
+      try {
+        $n = $errStream.EndRead($errPending)
+        if ($n -gt 0) {
+          $errMs.Write($errBuf, 0, $n)
+          $errPending = $errStream.BeginRead($errBuf, 0, $errBuf.Length, $null, $null)
+        } else { $errPending = $null }
+      } catch { $errPending = $null }
+    }
+    if ($sw.ElapsedMilliseconds -ge $TimeoutMs -and -not $Proc.HasExited) {
+      $timedOut = $true
+      try { $Proc.Kill() } catch {}
+    }
+    if ($Proc.HasExited -and -not $outPending -and -not $errPending) { break }
+    if ($sw.ElapsedMilliseconds -ge ($TimeoutMs + 3000)) { break }
+    Start-Sleep -Milliseconds 20
+  }
+  return [pscustomobject]@{ Out = $outMs.ToArray(); Err = $errMs.ToArray(); TimedOut = [bool]$timedOut }
+}
+
+function Invoke-HcOpenSslProc([string]$Exe, [string]$Arguments, [byte[]]$StdinBytes, [int]$TimeoutSec) {
+  $proc = $null
+  try {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $Exe
+    $psi.Arguments = $Arguments
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo = $psi
+    [void]$proc.Start()
+    if ($StdinBytes -and $StdinBytes.Length -gt 0) {
+      $proc.StandardInput.BaseStream.Write($StdinBytes, 0, $StdinBytes.Length)
+      $proc.StandardInput.BaseStream.Flush()
+    }
+    $proc.StandardInput.Close()
+    return (Receive-HcProcessBytes -Proc $proc -TimeoutMs ($TimeoutSec * 1000))
+  } finally {
+    if ($proc -and -not $proc.HasExited) { try { $proc.Kill() } catch {} }
+    if ($proc) { try { $proc.Dispose() } catch {} }
+  }
+}
+
+function Invoke-HcOpenSsl {
+  param(
+    [string]$Method,
+    [string]$Url,
+    [string]$Body,
+    [int]$TimeoutSec,
+    [string]$OpenSslPath,
+    [switch]$Anonymous
+  )
+  try {
+    if (-not $OpenSslPath) { $OpenSslPath = Find-HcOpenSsl }
+    if (-not $OpenSslPath) {
+      return [pscustomobject]@{ Ok = $false; Code = "000"; Body = "openssl.exe not found. Install Git for Windows or set SCALE_OPENSSL, or put the path in ScaleAPI-openssl.path."; Exit = 1 }
+    }
+    $parts = Split-HcRequestUrl $Url
+    $token = ""
+    if (-not $Anonymous) {
+      $token = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($userBox.Text.Trim() + ":" + $passBox.Text))
+    }
+    $raw = New-HcRawHttpBytes -Method $Method -HostHeader $parts.HostHeader -PathQuery $parts.Path -Body $Body -BasicToken $token
+    $token = $null
+    $opensslArgs = "s_client -connect $($parts.Host):$($parts.Port) -servername $($parts.Host) -quiet -ign_eof"
+    $got = Invoke-HcOpenSslProc -Exe $OpenSslPath -Arguments $opensslArgs -StdinBytes $raw -TimeoutSec $TimeoutSec
+    $raw = $null
+    $parsed = ConvertFrom-HcHttpBytes $got.Out
+    if ($parsed.Ok -and $parsed.Code -ne "000") {
+      return [pscustomobject]@{ Ok = $true; Code = $parsed.Code; Body = $parsed.Body.Trim(); Exit = 0 }
+    }
+    $errText = ""
+    if ($got.Err -and $got.Err.Length -gt 0) { $errText = [Text.Encoding]::UTF8.GetString($got.Err) }
+    if (-not $errText) { $errText = "openssl s_client returned no HTTP response" }
+    if ($got.TimedOut) { $errText = "openssl s_client timed out. $errText" }
+    return [pscustomobject]@{ Ok = $false; Code = "000"; Body = (Format-HcPublicError $errText); Exit = 1 }
+  } catch {
+    return [pscustomobject]@{ Ok = $false; Code = "000"; Body = (Format-HcPublicError (Get-HcExceptionText $_)); Exit = 1 }
+  }
+}
+
+function Get-HcOpenSslHandshake([string]$OpenSslPath, [string]$HostName, [int]$Port, [int]$TimeoutSec) {
+  # No HTTP and no credentials. Reads the handshake banner only.
+  try {
+    $opensslArgs = "s_client -connect ${HostName}:${Port} -servername $HostName"
+    $got = Invoke-HcOpenSslProc -Exe $OpenSslPath -Arguments $opensslArgs -StdinBytes (New-Object byte[] 0) -TimeoutSec $TimeoutSec
+    $text = ""
+    if ($got.Out) { $text += [Text.Encoding]::UTF8.GetString($got.Out) }
+    if ($got.Err) { $text += [Text.Encoding]::UTF8.GetString($got.Err) }
+    $proto = ""
+    $cipher = ""
+    if ($text -match 'TLSv1\.3') { $proto = "TLS 1.3" }
+    elseif ($text -match 'TLSv1\.2') { $proto = "TLS 1.2" }
+    elseif ($text -match 'TLSv1\.1') { $proto = "TLS 1.1" }
+    elseif ($text -match 'TLSv1\.0') { $proto = "TLS 1.0" }
+    if ($text -match 'Cipher is ([A-Za-z0-9_]+)') { $cipher = $Matches[1] }
+    if ($proto -and $cipher) { return "$proto $cipher" }
+    if ($proto) { return $proto }
+    return (Format-HcPublicError $text)
+  } catch {
+    return (Format-HcPublicError (Get-HcExceptionText $_))
+  }
+}
+
+function Get-HcTlsDiagnosis([string[]]$attempts, [string]$dotnetError, [string]$opensslError) {
+  $tried = "none"
+  if ($attempts -and $attempts.Count -gt 0) { $tried = ($attempts -join "; ") }
+  $text = @"
+This node only accepts TLS 1.3, which Windows 10 can't do. Install Git for Windows or run from Windows 11.
+Attempted schannel curl profiles: $tried.
+Schannel curl: $(Get-HcCurlExe)
+Attempted .NET protocols: $($script:HcDotNetProtoLabel).
+.NET: $(Format-HcPublicError $dotnetError)
+OpenSSL: $(Format-HcPublicError $opensslError)
+Git for Windows curl.exe is Schannel-only (CURL_SSL_BACKEND=openssl does not switch it). The OpenSSL binary that works is openssl.exe, usually C:\Program Files\Git\usr\bin\openssl.exe. Set SCALE_OPENSSL or ScaleAPI-openssl.path to point at a different openssl.exe.
+"@
+  return $text.Trim()
+}
+
+function Invoke-HcSslProbe {
+  param(
+    [Parameter(Mandatory)][string]$HostName,
+    [Parameter(Mandatory)][int]$ProtocolMask,
+    [int]$TimeoutMs = 12000
+  )
+  $tcp = $null
+  $ssl = $null
+  try {
+    $tcp = New-Object Net.Sockets.TcpClient
+    $wait = $tcp.BeginConnect($HostName, 443, $null, $null)
+    if (-not $wait.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) {
+      throw "TCP connect to ${HostName}:443 timed out"
+    }
+    $tcp.EndConnect($wait)
+    $callback = [Net.Security.RemoteCertificateValidationCallback]{ param($sender, $cert, $chain, $errors) return $true }
+    $ssl = New-Object Net.Security.SslStream($tcp.GetStream(), $false, $callback)
+    try {
+      $protocols = [System.Security.Authentication.SslProtocols]$ProtocolMask
+    } catch {
+      return [pscustomobject]@{ Ok = $false; Protocol = ""; Error = "Protocol value $ProtocolMask is not in SslProtocols on this runtime. Windows 10 Schannel does not offer TLS 1.3 by default; Windows 11 and Server 2022 do." }
+    }
+    $ssl.AuthenticateAsClient($HostName, $null, $protocols, $false)
+    $negotiated = "unknown"
+    try { $negotiated = [string]$ssl.SslProtocol } catch {}
+    return [pscustomobject]@{ Ok = $true; Protocol = $negotiated; Error = "" }
+  } catch {
+    return [pscustomobject]@{ Ok = $false; Protocol = ""; Error = (Get-HcExceptionText $_) }
+  } finally {
+    if ($ssl) { try { $ssl.Dispose() } catch {} }
+    if ($tcp) { try { $tcp.Close() } catch {} }
+  }
+}
+
+function Get-HcSslDiagnostic([string]$HostName) {
+  # Diagnostics only. 12288 = TLS 1.3, tried before TLS 1.2/1.1/1.0 (3072/768/192).
+  $tls13 = Invoke-HcSslProbe -HostName $HostName -ProtocolMask 12288
+  if ($tls13.Ok) {
+    return ("TLS 1.3 negotiated ({0}; diagnostics only, not used for API calls)" -f (ConvertTo-HcProtoLabel $tls13.Protocol))
+  }
+  $older = Invoke-HcSslProbe -HostName $HostName -ProtocolMask (192 -bor 768 -bor 3072)
+  $why13 = Format-HcPublicError $tls13.Error
+  if ($older.Ok) {
+    return ("TLS 1.3 failed ({0}). Negotiated {1} without TLS 1.3. Windows 10 Schannel does not offer TLS 1.3 by default; Windows 11 and Server 2022 do. Diagnostics only, not used for API calls." -f $why13, (ConvertTo-HcProtoLabel $older.Protocol))
+  }
+  return ("TLS 1.3 failed ({0}). TLS 1.0-1.2 also failed ({1}). Windows 10 Schannel does not offer TLS 1.3 by default; Windows 11 and Server 2022 do. The node may also require a cipher or curve Schannel lacks, such as ChaCha20-Poly1305 or an ECDSA-only suite." -f $why13, (Format-HcPublicError $older.Error))
+}
+
 function Invoke-Hc {
   param(
     [Parameter(Mandatory)][ValidateSet("GET","POST","PATCH","PUT","DELETE")][string]$Method,
@@ -100,28 +751,165 @@ function Invoke-Hc {
     [string]$Body = "",
     [int]$TimeoutSec = 60
   )
-  $ip = $ipBox.Text.Trim()
-  $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($userBox.Text.Trim() + ":" + $passBox.Text))
-  $cfg = [IO.Path]::GetTempFileName()
-  $bf = $null
-  try {
-    Set-Content -Path $cfg -Value "header = `"Authorization: Basic $b64`"" -Encoding ASCII
-    $url = if ($Path -match '^https?://') { $Path } elseif ($Path.StartsWith("/update/")) { "https://$ip$Path" } else { "https://$ip/rest$Path" }
-    $ca = @("-sSk", "--max-time", "$TimeoutSec", "-K", $cfg, "-X", $Method, "-w", "`n%{http_code}", $url)
-    if ($Body) {
-      $bf = [IO.Path]::GetTempFileName()
-      [IO.File]::WriteAllText($bf, $Body)
-      $ca += @("-H", "Content-Type: application/json", "--data-binary", "@$bf")
-    }
-    $raw = (& curl.exe @ca 2>&1) -join "`n"
-  } finally {
-    Remove-Item $cfg -Force -ErrorAction SilentlyContinue
-    if ($bf) { Remove-Item $bf -Force -ErrorAction SilentlyContinue }
+  $url = Get-HcUrl $Path
+
+  if ($script:Transport -eq "openssl") {
+    $r = Invoke-HcOpenSsl -Method $Method -Url $url -Body $Body -TimeoutSec $TimeoutSec -OpenSslPath $script:OpenSslPath
+    if ($r.Ok) { return [pscustomobject]@{ Code = $r.Code; Body = $r.Body } }
+    Say "OpenSSL transport failed; retrying schannel curl..."
+    $script:Transport = $null
   }
-  $lines = @($raw -split "`n")
-  $code = if ($lines.Count) { $lines[-1].Trim() } else { "000" }
-  $bodyText = if ($lines.Count -gt 1) { ($lines[0..($lines.Count - 2)] -join "`n").Trim() } else { "" }
-  [pscustomobject]@{ Code = $code; Body = $bodyText }
+
+  if ($script:Transport -eq "dotnet") {
+    $r = Invoke-HcDotNet -Method $Method -Url $url -Body $Body -TimeoutSec $TimeoutSec
+    if ($r.Ok) { return [pscustomobject]@{ Code = $r.Code; Body = $r.Body } }
+    Say ".NET transport failed; retrying curl TLS ladder..."
+    $script:Transport = $null
+  }
+
+  $onlyRemembered = [bool]($script:Transport -eq "curl" -and $script:CurlProfileLabel)
+  $curl = Invoke-HcCurlLadder -Method $Method -Url $url -Body $Body -TimeoutSec $TimeoutSec -OnlyRemembered:$onlyRemembered
+  if ($curl.Ok) { return [pscustomobject]@{ Code = $curl.Code; Body = $curl.Body } }
+  if ($onlyRemembered -and $curl.TlsFailure) {
+    $failedLabel = [string]$script:CurlProfileLabel
+    $previousAttempts = @($curl.Attempts)
+    $script:Transport = $null
+    $script:CurlProfileLabel = $null
+    $script:CurlProfileArgs = @()
+    $curl = Invoke-HcCurlLadder -Method $Method -Url $url -Body $Body -TimeoutSec $TimeoutSec -SkipLabel $failedLabel
+    $merged = @(@($previousAttempts) + @($curl.Attempts) | Where-Object { $_ })
+    $curl = [pscustomobject]@{ Ok = $curl.Ok; Code = $curl.Code; Body = $curl.Body; TlsFailure = $curl.TlsFailure; Attempts = $merged }
+    if ($curl.Ok) { return [pscustomobject]@{ Code = $curl.Code; Body = $curl.Body } }
+  }
+  if (-not $curl.TlsFailure) {
+    return [pscustomobject]@{ Code = "000"; Body = $curl.Body }
+  }
+
+  Say ("Retrying with .NET HttpWebRequest ({0}, cert check skipped)..." -f $script:HcDotNetProtoLabel)
+  $r2 = Invoke-HcDotNet -Method $Method -Url $url -Body $Body -TimeoutSec $TimeoutSec
+  if ($r2.Ok) {
+    $script:Transport = "dotnet"
+    $script:CurlProfileLabel = $null
+    Say "Connected via .NET fallback."
+    return [pscustomobject]@{ Code = $r2.Code; Body = $r2.Body }
+  }
+
+  $opensslPath = Find-HcOpenSsl
+  $opensslError = "openssl.exe not found. Install Git for Windows or set SCALE_OPENSSL, or put the path in ScaleAPI-openssl.path."
+  if ($opensslPath) {
+    Say ("Schannel and .NET failed. Retrying with OpenSSL s_client: {0}" -f $opensslPath)
+    $r3 = Invoke-HcOpenSsl -Method $Method -Url $url -Body $Body -TimeoutSec $TimeoutSec -OpenSslPath $opensslPath
+    if ($r3.Ok) {
+      $script:Transport = "openssl"
+      $script:OpenSslPath = $opensslPath
+      $script:CurlProfileLabel = $null
+      Say "Connected via OpenSSL s_client. This node speaks TLS 1.3, which Windows 10 Schannel cannot do."
+      return [pscustomobject]@{ Code = $r3.Code; Body = $r3.Body }
+    }
+    $opensslError = $r3.Body
+  } else {
+    Say $opensslError
+  }
+  $diag = Get-HcTlsDiagnosis -attempts @($curl.Attempts) -dotnetError $r2.Body -opensslError $opensslError
+  [pscustomobject]@{ Code = "000"; Body = $diag }
+}
+
+function Invoke-HcTlsTest {
+  $ip = $ipBox.Text.Trim()
+  if (-not $ip) { Show-Msg "Enter the cluster IP or host." "Warning"; return }
+  Set-Busy $true
+  try {
+    Say "--- Test TLS $ip"
+    Say ("No credentials are sent. Schannel curl: {0}" -f (Get-HcCurlExe))
+    Say "Order: curl --tlsv1.3, then default, then TLS 1.0-1.1, then .NET, then OpenSSL s_client."
+    Say "Windows 10 Schannel does not offer TLS 1.3 by default. Windows 11 and Server 2022 do."
+    $winner = $null
+    $gotTransport = $false
+    $winnerNeg = ""
+    foreach ($tlsProfile in @(Get-HcCurlProfiles)) {
+      $tlsArgs = @()
+      if ($tlsProfile.Args) { $tlsArgs = @($tlsProfile.Args) }
+      $r = Invoke-HcCurlOnce -Method GET -Url "https://$ip/" -Body "" -TimeoutSec 20 -TlsArgs $tlsArgs -Anonymous -CaptureTrace
+      if ($r.Ok) {
+        $winnerNeg = Get-HcNegotiatedTls $r.Body
+        $shown = if ($winnerNeg) { $winnerNeg } else { "protocol not reported by curl" }
+        Say ("curl {0}: connected ({1}, HTTP {2})" -f $tlsProfile.Label, $shown, $r.Code)
+        $winner = $tlsProfile
+        $gotTransport = $true
+        $script:Transport = "curl"
+        $script:CurlProfileLabel = [string]$tlsProfile.Label
+        $script:CurlProfileArgs = $tlsArgs
+        break
+      }
+      Say ("curl {0}: failed (exit {1}) {2}" -f $tlsProfile.Label, $r.Exit, (Format-HcPublicError $r.Body))
+      if ($tlsProfile.Label -eq "TLS 1.3") {
+        Say "curl TLS 1.3 did not connect. On Windows 10 that is expected: Schannel has no TLS 1.3 unless the PC is Windows 11 or Server 2022."
+      }
+    }
+    if ($winner) {
+      $extra = if ($winnerNeg) { " Negotiated $winnerNeg." } else { "" }
+      Say ("Test TLS: curl profile '{0}' succeeded.{1} Later API calls use it until Connect." -f $winner.Label, $extra)
+    } else {
+      Say ("Retrying with .NET HttpWebRequest ({0}, cert check skipped)..." -f $script:HcDotNetProtoLabel)
+      $n = Invoke-HcDotNet -Method GET -Url "https://$ip/" -Body "" -TimeoutSec 20 -Anonymous
+      if ($n.Ok) {
+        $gotTransport = $true
+        $script:Transport = "dotnet"
+        $script:CurlProfileLabel = $null
+        Say ("Test TLS: .NET HttpWebRequest succeeded (HTTP {0}) using {1}." -f $n.Code, $script:HcDotNetProtoLabel)
+      } else {
+        Say ("Test TLS: .NET HttpWebRequest failed: {0}" -f (Format-HcPublicError $n.Body))
+      }
+    }
+
+    $opensslPath = Find-HcOpenSsl
+    if ($opensslPath) {
+      Say ("OpenSSL: {0}" -f $opensslPath)
+      $banner = Get-HcOpenSslHandshake -OpenSslPath $opensslPath -HostName $ip -Port 443 -TimeoutSec 15
+      Say ("OpenSSL handshake: {0}" -f $banner)
+      if (-not $gotTransport) {
+        $o = Invoke-HcOpenSsl -Method GET -Url "https://$ip/rest/v1/ping" -Body "" -TimeoutSec 20 -OpenSslPath $opensslPath -Anonymous
+        if ($o.Ok) {
+          $gotTransport = $true
+          $script:Transport = "openssl"
+          $script:OpenSslPath = $opensslPath
+          $script:CurlProfileLabel = $null
+          Say ("Test TLS: OpenSSL s_client succeeded (HTTP {0}). Later API calls use it until Connect." -f $o.Code)
+        } else {
+          Say ("OpenSSL s_client failed: {0}" -f (Format-HcPublicError $o.Body))
+        }
+      }
+    } else {
+      Say "OpenSSL: not found. Install Git for Windows or set SCALE_OPENSSL, or put the path in ScaleAPI-openssl.path."
+    }
+    if (-not $gotTransport) {
+      Say "This node only accepts TLS 1.3, which Windows 10 can't do. Install Git for Windows or run from Windows 11."
+    }
+
+    Say "SslStream diagnostic (no credentials), TLS 1.3 first:"
+    $only13 = Invoke-HcSslProbe -HostName $ip -ProtocolMask 12288
+    if ($only13.Ok) {
+      Say ("SslStream TLS 1.3: succeeded ({0})." -f (ConvertTo-HcProtoLabel $only13.Protocol))
+    } else {
+      Say ("SslStream TLS 1.3: failed: {0}" -f (Format-HcPublicError $only13.Error))
+      if (-not $gotTransport) {
+        Say "Windows 10 Schannel does not offer TLS 1.3 by default. Windows 11 and Server 2022 do."
+        foreach ($one in @(
+          @{ Name = "TLS 1.2"; Mask = 3072 },
+          @{ Name = "TLS 1.1"; Mask = 768 },
+          @{ Name = "TLS 1.0"; Mask = 192 }
+        )) {
+          $p = Invoke-HcSslProbe -HostName $ip -ProtocolMask $one.Mask
+          if ($p.Ok) {
+            Say ("SslStream {0}: succeeded ({1})" -f $one.Name, (ConvertTo-HcProtoLabel $p.Protocol))
+          } else {
+            Say ("SslStream {0}: failed: {1}" -f $one.Name, (Format-HcPublicError $p.Error))
+          }
+        }
+        Say "This node only accepts TLS 1.3, which Windows 10 can't do. Install Git for Windows or run from Windows 11."
+      }
+    }
+  } finally { Set-Busy $false }
 }
 
 function ConvertFrom-HcJson([string]$json) {
@@ -166,6 +954,7 @@ function Wait-HcTask([string]$tag, [int]$maxSeconds = 120) {
 function Set-Busy([bool]$busy) {
   $form.UseWaitCursor = $busy
   $connectBtn.Enabled = -not $busy
+  $testTlsBtn.Enabled = -not $busy
   [Windows.Forms.Application]::DoEvents()
 }
 
@@ -198,6 +987,9 @@ function Show-ClusterInfo {
   if (-not (Test-Credentials)) { return }
   Set-Busy $true
   try {
+    $script:Transport = $null
+    $script:CurlProfileLabel = $null
+    $script:CurlProfileArgs = @()
     Say "--- Cluster $($ipBox.Text.Trim())"
     $c = Invoke-Hc GET "/v1/Cluster"
     if ($c.Code -eq "401") { Set-Connected $false "Login failed"; Say "Login failed (401)."; return }
@@ -206,7 +998,7 @@ function Show-ClusterInfo {
     $name = if ($rec.clusterName) { $rec.clusterName } else { "?" }
     $ver = if ($rec.icosVersion) { $rec.icosVersion } else { "?" }
     $uuid = if ($rec.uuid) { $rec.uuid } else { "?" }
-    Set-Connected $true "$name  ·  HyperCore $ver"
+    Set-Connected $true "$name  -  HyperCore $ver"
     $clusterOut.Text = @"
 Cluster name : $name
 Version      : $ver
@@ -246,7 +1038,7 @@ function Show-UpdateStatus {
     Say "--- Update status (no auth)"
     $r = Invoke-Hc GET "/update/update_status.json"
     if ($r.Code -eq "404") {
-      $clusterOut.Text = "Update status: never updated / endpoint returned 404.`r`nTreat as unknown — fail closed for writes during upgrades."
+      $clusterOut.Text = "Update status: never updated / endpoint returned 404.`r`nTreat as unknown - fail closed for writes during upgrades."
       Say "Update status 404 (never updated or unavailable)."
       return
     }
@@ -340,7 +1132,7 @@ function Invoke-VmAction([string]$actionType) {
   try {
     Say "--- VM $actionType  $($vm.name)"
     $body = (@(@{ virDomainUUID = $vm.uuid; actionType = $actionType }) | ConvertTo-Json -Compress -Depth 5)
-    # ConvertTo-Json of single-element array becomes object in PS 5.1 — force array wrapper
+    # ConvertTo-Json of single-element array becomes object in PS 5.1 - force array wrapper
     if ($body -notmatch '^\s*\[') { $body = "[$body]" }
     $r = Invoke-Hc POST "/v1/VirDomain/action" $body
     if ($r.Code -notin @("200", "201")) { Say "Action failed ($($r.Code)): $($r.Body)"; return }
@@ -465,7 +1257,7 @@ function Get-SnmpStatus {
   $ver = if ($rec.icosVersion) { $rec.icosVersion } else { "unknown" }
   $name = if ($rec.clusterName) { $rec.clusterName } else { "" }
   Write-Snmp "Cluster $name  HyperCore $ver"
-  Set-Connected $true "$name  ·  HyperCore $ver"
+  Set-Connected $true "$name  -  HyperCore $ver"
   $s = Invoke-Hc GET "/v2/SNMPConfig"
   if ($s.Code -eq "404") { Write-Snmp "This cluster has no SNMP API. It needs HyperCore 9.7.1 or newer."; return $null }
   if ($s.Code -ne "200") { Write-Snmp "SNMP status failed ($($s.Code)): $($s.Body)"; return $null }
@@ -660,7 +1452,7 @@ $sendApiBtn.Add_Click({
       $parsed = ConvertFrom-HcJson $r.Body
       if ($parsed -and $parsed.taskTag) { [void](Wait-HcTask ([string]$parsed.taskTag)) }
     }
-    Say "$method $path → $($r.Code)"
+    Say "$method $path -> $($r.Code)"
   } finally { Set-Busy $false }
 })
 
@@ -669,11 +1461,17 @@ $tabs.TabPages.AddRange(@($tabCluster, $tabVms, $tabSnaps, $tabSnmp, $tabAlerts,
 
 # Connect button = cluster refresh
 $connectBtn.Add_Click({ Show-ClusterInfo })
+$testTlsBtn.Add_Click({ Invoke-HcTlsTest })
+$ipBox.Add_TextChanged({
+  $script:Transport = $null
+  $script:CurlProfileLabel = $null
+  $script:CurlProfileArgs = @()
+})
 $form.AcceptButton = $connectBtn
 
 $form.Add_Shown({
-  Say "Scale HyperCore API Toolkit ready. Enter cluster credentials and click Connect."
-  Say "Log file: $logFile"
+  Say "Scale HyperCore API Toolkit $($script:AppVersion) ready. Enter cluster credentials and click Connect."
+  Say "If Connect fails with a TLS error, click Test TLS. Log file: $logFile"
 })
 
 $form.Add_FormClosed({ $passBox.Text = "" })
