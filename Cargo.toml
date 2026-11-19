@@ -19,6 +19,10 @@ chrono = "0.4"
 regex = "1"
 base64 = "0.22"
 
+[features]
+# Keep the Windows console window: startup messages print to the terminal.
+console = []
+
 [target.'cfg(windows)'.dependencies]
 rfd = "0.15"
 

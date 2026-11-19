@@ -1,6 +1,10 @@
 // Scale HyperCore API Toolkit - Windows UI for SC//HyperCore REST (v1 + SNMP v2).
 // No console window on Windows release builds.
-#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+// The `console` feature keeps the console so startup problems print to the terminal.
+#![cfg_attr(
+    all(windows, not(debug_assertions), not(feature = "console")),
+    windows_subsystem = "windows"
+)]
 
 mod app;
 mod audit;
@@ -18,15 +22,21 @@ fn app_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// Startup problems go to ScaleAPI-log.txt: there is no console to print to.
+/// Startup problems go to ScaleAPI-log.txt next to the exe, or to %TEMP% when that
+/// folder is not writable. They also go to stderr (visible in the console build).
 fn log_startup(text: &str) {
-    let path = app_dir().join("ScaleAPI-log.txt");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(
-            f,
-            "{}  [startup] {text}",
-            chrono::Local::now().format("%Y-%m-%dT%H:%M:%S")
-        );
+    let line = format!(
+        "{}  [startup] {text}",
+        chrono::Local::now().format("%Y-%m-%dT%H:%M:%S")
+    );
+    eprintln!("{line}");
+    for dir in [app_dir(), std::env::temp_dir()] {
+        let path = dir.join("ScaleAPI-log.txt");
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            if writeln!(f, "{line}").is_ok() {
+                return;
+            }
+        }
     }
 }
 

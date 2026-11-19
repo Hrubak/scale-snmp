@@ -51,6 +51,8 @@ On Windows that writes `target\release\ScaleAPI.exe`. From Linux, cross-compile 
 cargo build --release --target x86_64-pc-windows-gnu
 ```
 
+For troubleshooting a PC where the window never opens, build with the console kept: `cargo build --release --features console`. Startup messages then print to the terminal. They are also written to `ScaleAPI-log.txt` next to the `.exe`, or to `%TEMP%` when that folder is not writable.
+
 GitHub Actions (`.github/workflows/build.yml`) runs the tests and uploads `ScaleAPI.exe` as a build artifact on every push to `main` and every pull request.
 
 Set `SCALE_TEST_HOST`, `SCALE_TEST_USER`, and `SCALE_TEST_PASS` to run `jobs::live` against a cluster. It is read-only: TLS handshakes, GETs, and a SuperAudit written to the temp folder.
