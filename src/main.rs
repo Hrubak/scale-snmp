@@ -10,6 +10,7 @@ mod app;
 mod audit;
 mod http;
 mod jobs;
+mod soft;
 mod util;
 
 use std::io::Write;
@@ -58,16 +59,34 @@ fn show_error(text: &str) {
     eprintln!("{text}");
 }
 
+/// Windows version straight from ntdll (no child process).
 fn os_info() -> String {
     #[cfg(windows)]
     {
-        let out = std::process::Command::new("cmd")
-            .args(["/C", "ver"])
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_default();
-        if !out.is_empty() {
-            return out;
+        #[repr(C)]
+        struct OsVersionInfoW {
+            size: u32,
+            major: u32,
+            minor: u32,
+            build: u32,
+            platform: u32,
+            csd: [u16; 128],
+        }
+        #[link(name = "ntdll")]
+        extern "system" {
+            fn RtlGetVersion(info: *mut OsVersionInfoW) -> i32;
+        }
+        let mut v = OsVersionInfoW {
+            size: std::mem::size_of::<OsVersionInfoW>() as u32,
+            major: 0,
+            minor: 0,
+            build: 0,
+            platform: 0,
+            csd: [0; 128],
+        };
+        // SAFETY: v is a correctly sized OSVERSIONINFOW with `size` set.
+        if unsafe { RtlGetVersion(&mut v) } == 0 {
+            return format!("Windows {}.{}.{}", v.major, v.minor, v.build);
         }
     }
     format!("{} {}", std::env::consts::OS, std::env::consts::ARCH)
@@ -150,12 +169,27 @@ fn launch(renderer: eframe::Renderer) -> eframe::Result<()> {
     let r = eframe::run_native(
         app::APP_TITLE,
         options(renderer),
-        Box::new(|cc| Ok(Box::new(app::App::new(cc)))),
+        Box::new(|cc| Ok(Box::new(app::App::new(&cc.egui_ctx)))),
     );
     if let Err(e) = &r {
         log_startup(&format!("renderer {renderer:?} failed: {e}"));
     }
     r
+}
+
+fn relaunch_software() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| format!("Software: current exe: {e}"))?;
+    let status = std::process::Command::new(exe)
+        .args(std::env::args_os().skip(1))
+        .env("SCALE_RENDERER", "software")
+        .status()
+        .map_err(|e| format!("Software: restart failed: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        // The child already logged and reported its own error.
+        std::process::exit(status.code().unwrap_or(1));
+    }
 }
 
 fn main() {
@@ -176,22 +210,30 @@ fn main() {
     // Direct3D 12 / Vulkan first: over RDP or on a VM without a GPU, Windows still
     // offers the Microsoft Basic Render Driver for D3D12 but only OpenGL 1.1.
     // OpenGL is the fallback. SCALE_RENDERER=glow forces OpenGL.
-    let force_glow = std::env::var("SCALE_RENDERER")
-        .map(|v| v.eq_ignore_ascii_case("glow"))
-        .unwrap_or(false);
-    let result: Result<(), String> = if force_glow {
-        launch(eframe::Renderer::Glow).map_err(|e| format!("OpenGL: {e}"))
-    } else {
-        match launch(eframe::Renderer::Wgpu) {
+    let renderer = std::env::var("SCALE_RENDERER")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let result: Result<(), String> = match renderer.as_str() {
+        "software" => soft::run().map_err(|e| format!("Software: {e}")),
+        "glow" => launch(eframe::Renderer::Glow).map_err(|e| format!("OpenGL: {e}")),
+        _ => match launch(eframe::Renderer::Wgpu) {
             Ok(()) => Ok(()),
-            Err(first) => launch(eframe::Renderer::Glow)
-                .map_err(|second| format!("Direct3D/Vulkan: {first}\nOpenGL: {second}")),
-        }
+            Err(first) => match launch(eframe::Renderer::Glow) {
+                Ok(()) => Ok(()),
+                Err(second) => {
+                    // No GPU path. winit allows one event loop per process, so the
+                    // software renderer starts in a fresh copy of this exe.
+                    log_startup(&format!(
+                        "no GPU renderer (Direct3D/Vulkan: {first}; OpenGL: {second}); restarting with software rendering"
+                    ));
+                    relaunch_software()
+                }
+            },
+        },
     };
     if let Err(e) = result {
         let text = format!(
-            "The window could not be created.\n\n{e}\n\nThis PC has no usable graphics driver for Direct3D 12 or OpenGL 2+. \
-             See ScaleAPI-log.txt next to ScaleAPI.exe."
+            "The window could not be created.\n\n{e}\n\nSee ScaleAPI-log.txt next to ScaleAPI.exe."
         );
         log_startup(&text.replace('\n', " | "));
         show_error(&text);

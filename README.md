@@ -36,7 +36,8 @@ Not included from that example: daemon mode, SQLite or PostgreSQL history, the F
 - Windows 10 or 11, x64. TLS 1.2 and 1.3 are built into the `.exe` (rustls), so HyperCore 9.7.11's TLS 1.3-only `TLS_AES_256_GCM_SHA384` works on Windows 10 without Schannel or Git's `openssl.exe`.
 - Network reachability to a cluster node IP (there is no cluster VIP — use a node `lanIP`)
 - SNMP tab needs SC//HyperCore **9.7.1 or newer** (REST v2). Other tabs work on 9.6+
-- The window draws with Direct3D 12 (or Vulkan) and falls back to OpenGL. Over RDP or on a VM without a GPU, Windows supplies a software Direct3D adapter. If the window still does not open, set `SCALE_RENDERER=glow` to force OpenGL.
+- No GPU is required. The window draws with Direct3D 12 or Vulkan, then OpenGL 2+. If neither works (Server 2019 over ScreenConnect or RDP offers no Direct3D 12 adapter and only OpenGL 1.1), the app restarts itself with a built-in CPU renderer that paints through GDI. The title bar then says "(software rendering)". `SCALE_RENDERER=software` or `SCALE_RENDERER=glow` forces one renderer.
+- The `.exe` is not code-signed. Microsoft Defender's machine-learning detection (`Trojan:Win32/Bearfoos.A!ml`) has flagged an unsigned cross-compiled build. Prefer the build from GitHub Actions, compare its SHA-256, and report false positives at https://www.microsoft.com/wdsi/filesubmission. Do not turn off Defender or exclude whole folders to run it.
 
 ## Build
 

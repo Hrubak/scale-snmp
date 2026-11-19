@@ -85,8 +85,8 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        cc.egui_ctx.set_visuals(egui::Visuals::light());
+    pub fn new(egui_ctx: &egui::Context) -> Self {
+        egui_ctx.set_visuals(egui::Visuals::light());
         let app_dir = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()))
@@ -760,6 +760,23 @@ fn open_path(p: &std::path::Path) {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.ui(ctx);
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.shutdown();
+    }
+}
+
+impl App {
+    /// Clear secrets from memory when the window closes.
+    pub fn shutdown(&mut self) {
+        self.pass.clear();
+        self.community.clear();
+    }
+
+    /// One frame of UI. Shared by eframe (GPU) and the software renderer.
+    pub fn ui(&mut self, ctx: &egui::Context) {
         self.drain();
         let modal = self.alert.is_some() || self.confirm.is_some();
         if self.busy {
@@ -890,10 +907,5 @@ impl eframe::App for App {
                 None => {}
             }
         }
-    }
-
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.pass.clear();
-        self.community.clear();
     }
 }

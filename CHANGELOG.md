@@ -10,6 +10,8 @@
 - SuperAudit output matches 0.5.0: the same columns, warning rules, compliance score, capacity rows, HTML, and BOM-prefixed quoted CSV files. The PowerShell test cases are ported to `cargo test`.
 - The SNMP tab shows the raw SNMP status. The shared log and `ScaleAPI-log.txt` get a copy with `communityName` redacted.
 - Rendering uses Direct3D 12 or Vulkan, with OpenGL as the fallback. On a server with no GPU (for example Server 2019 reached over ScreenConnect or RDP), the app picks Microsoft's software Direct3D 12 adapter (WARP) itself, because egui-wgpu's default adapter request found none there. `SCALE_RENDERER=glow` forces OpenGL.
+- Built-in CPU renderer (`src/soft.rs`): when no GPU renderer starts, the app restarts itself with software rendering through GDI, so it runs on GPU-less servers. Tested by forcing both GPU paths to fail.
+- No child process at startup: the Windows version comes from `RtlGetVersion` instead of `cmd /C ver`. The `.exe` now carries a Windows version resource (description, product name, version). Both changes follow a Defender machine-learning false positive on an unsigned build.
 - Startup steps, every graphics adapter Windows offers, renderer errors, and crashes are written to `ScaleAPI-log.txt` (or `%TEMP%`), and a failure shows a message box instead of exiting silently. `--features console` builds `ScaleAPI-console.exe` for troubleshooting; CI uploads both.
 - The PowerShell 0.5.0 files stay in the repo as the legacy version.
 
