@@ -31,13 +31,17 @@ It reads cluster name and version, nodes, VM inventory (CPU, memory, boot, HA, d
 
 Not included from that example: daemon mode, SQLite or PostgreSQL history, the Flask dashboard, VM filters, JSON export, and growth forecasts (those need the historical database). The upstream `generate_excel_workbook` function also does not write the Compliance or Capacity sheets; this report includes them from the published targets.
 
+## Download
+
+Get `ScaleAPI.exe` from the [latest release](https://github.com/Hrubak/scale-snmp/releases/latest). `ScaleAPI-console.exe` is the same app with a console window for troubleshooting startup.
+
 ## Requirements
 
-- Windows 10 or 11, x64. TLS 1.2 and 1.3 are built into the `.exe` (rustls), so HyperCore 9.7.11's TLS 1.3-only `TLS_AES_256_GCM_SHA384` works on Windows 10 without Schannel or Git's `openssl.exe`.
+- Windows 10 or 11, or Windows Server 2019 or newer, x64. TLS 1.2 and 1.3 are built into the `.exe` (rustls), so HyperCore 9.7.11's TLS 1.3-only `TLS_AES_256_GCM_SHA384` works on Windows 10 without Schannel or Git's `openssl.exe`.
 - Network reachability to a cluster node IP (there is no cluster VIP — use a node `lanIP`)
 - SNMP tab needs SC//HyperCore **9.7.1 or newer** (REST v2). Other tabs work on 9.6+
 - No GPU is required. The window draws with Direct3D 12 or Vulkan, then OpenGL 2+. If neither works (Server 2019 over ScreenConnect or RDP offers no Direct3D 12 adapter and only OpenGL 1.1), the app restarts itself with a built-in CPU renderer that paints through GDI. The title bar then says "(software rendering)". `SCALE_RENDERER=software` or `SCALE_RENDERER=glow` forces one renderer.
-- The `.exe` is not code-signed. Microsoft Defender's machine-learning detection (`Trojan:Win32/Bearfoos.A!ml`) has flagged an unsigned cross-compiled build. Prefer the build from GitHub Actions, compare its SHA-256, and report false positives at https://www.microsoft.com/wdsi/filesubmission. Do not turn off Defender or exclude whole folders to run it.
+- The `.exe` is not code-signed. Microsoft Defender's machine-learning detection (`Trojan:Win32/Bearfoos.A!ml`) has flagged an unsigned cross-compiled build. Prefer the build from the GitHub Release, compare it with `SHA256SUMS.txt` there (`Get-FileHash .\ScaleAPI.exe`), and report false positives at https://www.microsoft.com/wdsi/filesubmission. Do not turn off Defender or exclude whole folders to run it.
 
 ## Build
 
@@ -54,7 +58,7 @@ cargo build --release --target x86_64-pc-windows-gnu
 
 For troubleshooting a PC where the window never opens, build with the console kept: `cargo build --release --features console`. Startup messages then print to the terminal. They are also written to `ScaleAPI-log.txt` next to the `.exe`, or to `%TEMP%` when that folder is not writable.
 
-GitHub Actions (`.github/workflows/build.yml`) runs the tests and uploads `ScaleAPI.exe` as a build artifact on every push to `main` and every pull request.
+GitHub Actions (`.github/workflows/build.yml`) runs the tests and uploads `ScaleAPI.exe` and `ScaleAPI-console.exe` as a build artifact on every push to `main` and every pull request. Pushing a `v*` tag (for example `git tag v0.6.0 && git push origin v0.6.0`) also publishes both with `SHA256SUMS.txt` as a GitHub Release; the notes come from that version's section in `CHANGELOG.md`.
 
 Set `SCALE_TEST_HOST`, `SCALE_TEST_USER`, and `SCALE_TEST_PASS` to run `jobs::live` against a cluster. It is read-only: TLS handshakes, GETs, and a SuperAudit written to the temp folder.
 
