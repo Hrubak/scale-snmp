@@ -32,7 +32,11 @@ fn log_startup(text: &str) {
     eprintln!("{line}");
     for dir in [app_dir(), std::env::temp_dir()] {
         let path = dir.join("ScaleAPI-log.txt");
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
             if writeln!(f, "{line}").is_ok() {
                 return;
             }
@@ -69,9 +73,70 @@ fn os_info() -> String {
     format!("{} {}", std::env::consts::OS, std::env::consts::ARCH)
 }
 
+/// Pick the wgpu adapter ourselves. egui-wgpu's default request skips the
+/// software adapter, and on a server with no GPU (Server 2019 over ScreenConnect
+/// or RDP) the only Direct3D 12 adapter is Microsoft's WARP ("Microsoft Basic
+/// Render Driver"). Hardware is preferred; WARP is accepted last. Every adapter
+/// Windows offers is written to the startup log.
+fn adapter_selector() -> eframe::egui_wgpu::NativeAdapterSelectorMethod {
+    use eframe::wgpu::DeviceType;
+    std::sync::Arc::new(|adapters, surface| {
+        if adapters.is_empty() {
+            log_startup("wgpu: Windows offered no Direct3D 12 or Vulkan adapters");
+        }
+        let rank = |t: DeviceType| match t {
+            DeviceType::DiscreteGpu => 0,
+            DeviceType::IntegratedGpu => 1,
+            DeviceType::VirtualGpu => 2,
+            DeviceType::Other => 3,
+            DeviceType::Cpu => 4,
+        };
+        let mut best: Option<(u8, &eframe::wgpu::Adapter)> = None;
+        for a in adapters {
+            let info = a.get_info();
+            let ok = surface.map(|s| a.is_surface_supported(s)).unwrap_or(true);
+            log_startup(&format!(
+                "wgpu adapter: {} | {:?} | {:?} | driver {} {} | surface {}",
+                info.name,
+                info.backend,
+                info.device_type,
+                info.driver,
+                info.driver_info,
+                if ok { "ok" } else { "not supported" }
+            ));
+            if !ok {
+                continue;
+            }
+            let r = rank(info.device_type);
+            if best.map(|(br, _)| r < br).unwrap_or(true) {
+                best = Some((r, a));
+            }
+        }
+        match best {
+            Some((_, a)) => {
+                let info = a.get_info();
+                log_startup(&format!(
+                    "wgpu: using {} ({:?}, {:?})",
+                    info.name, info.backend, info.device_type
+                ));
+                Ok(a.clone())
+            }
+            None => Err(format!(
+                "none of the {} adapter(s) can draw to this window",
+                adapters.len()
+            )),
+        }
+    })
+}
+
 fn options(renderer: eframe::Renderer) -> eframe::NativeOptions {
+    let mut wgpu_options = eframe::egui_wgpu::WgpuConfiguration::default();
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(ref mut create) = wgpu_options.wgpu_setup {
+        create.native_adapter_selector = Some(adapter_selector());
+    }
     eframe::NativeOptions {
         renderer,
+        wgpu_options,
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title(format!("{} {}", app::APP_TITLE, env!("CARGO_PKG_VERSION")))
             .with_inner_size([1000.0, 720.0])
