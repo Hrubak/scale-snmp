@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.6.0
+
+- Rewritten in Rust as one `ScaleAPI.exe` (about 8 MB, no installer, only stock Windows DLLs). Same tabs: Cluster, VMs, Snapshots, SNMP, Alerts, Settings, SuperAudit, API.
+- TLS is rustls, built in. TLS 1.3 (`TLS_AES_256_GCM_SHA384`) works on Windows 10, so the Schannel curl ladder, the .NET fallback, and the `openssl s_client` transport are gone, along with `SCALE_OPENSSL` and `ScaleAPI-openssl.path`. TLS 1.0 and 1.1 are not offered.
+- Network calls run on a background thread. The window no longer freezes during task waits or SuperAudit.
+- Test TLS reports a TLS 1.3-only handshake, a TLS 1.2-only handshake, and an anonymous `GET /`, each with the negotiated protocol and cipher.
+- Confirm prompts (Shutdown, Power off, Reboot, snapshot delete, SNMP already on, non-GET API calls) are modal.
+- SuperAudit output matches 0.5.0: the same columns, warning rules, compliance score, capacity rows, HTML, and BOM-prefixed quoted CSV files. The PowerShell test cases are ported to `cargo test`.
+- The SNMP tab shows the raw SNMP status. The shared log and `ScaleAPI-log.txt` get a copy with `communityName` redacted.
+- Rendering uses Direct3D 12 or Vulkan, with OpenGL as the fallback, so it works over RDP. `SCALE_RENDERER=glow` forces OpenGL.
+- The PowerShell 0.5.0 files stay in the repo as the legacy version.
+
 ## 0.5.0
 
 - SuperAudit tab. Read-only GET audit of the connected cluster: cluster, nodes, VMs (disks, network, snapshots, schedules, replication), drive health, ISOs, and active conditions.
