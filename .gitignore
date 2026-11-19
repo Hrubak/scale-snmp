@@ -2,3 +2,4 @@ ScaleAPI-log.txt
 ScaleAPI-openssl.path
 superaudit_*/
 /target
+/dist

@@ -18,8 +18,16 @@ jobs:
         run: cargo test --locked
       - name: Build release
         run: cargo build --release --locked
+      - name: Build console variant (troubleshooting)
+        shell: pwsh
+        run: |
+          Copy-Item target/release/ScaleAPI.exe ScaleAPI.exe
+          cargo build --release --locked --features console
+          Copy-Item target/release/ScaleAPI.exe ScaleAPI-console.exe
       - uses: actions/upload-artifact@v4
         with:
           name: ScaleAPI-windows-x64
-          path: target/release/ScaleAPI.exe
+          path: |
+            ScaleAPI.exe
+            ScaleAPI-console.exe
           if-no-files-found: error
