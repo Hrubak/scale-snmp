@@ -1,0 +1,66 @@
+name: Build ScaleAPI.exe
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --locked
+      - name: Build release
+        run: cargo build --release --locked
+      - name: Build console variant (troubleshooting)
+        shell: pwsh
+        run: |
+          Copy-Item target/release/ScaleAPI.exe ScaleAPI.exe
+          cargo build --release --locked --features console
+          Copy-Item target/release/ScaleAPI.exe ScaleAPI-console.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ScaleAPI-windows-x64
+          path: |
+            ScaleAPI.exe
+            ScaleAPI-console.exe
+          if-no-files-found: error
+
+  release:
+    # A pushed v* tag publishes the tested build as a GitHub Release.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ScaleAPI-windows-x64
+          path: dist
+      - name: Checksums and release notes
+        run: |
+          cd dist && sha256sum ScaleAPI.exe ScaleAPI-console.exe > SHA256SUMS.txt && cat SHA256SUMS.txt && cd ..
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="## $version" '$0==v{on=1;next} /^## /{on=0} on' CHANGELOG.md > notes.md
+          test -s notes.md || { echo "CHANGELOG.md has no '## $version' section"; exit 1; }
+          printf '\n### SHA-256\n\n```\n%s\n```\n' "$(cat dist/SHA256SUMS.txt)" >> notes.md
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: ScaleAPI ${{ github.ref_name }}
+          body_path: notes.md
+          files: |
+            dist/ScaleAPI.exe
+            dist/ScaleAPI-console.exe
+            dist/SHA256SUMS.txt
+          fail_on_unmatched_files: true
